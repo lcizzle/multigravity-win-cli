@@ -18,7 +18,7 @@ No more logging in and out. Launch as many profiles as you need, all at once.
 **Windows** — open PowerShell and run:
 
 ```powershell
-irm https://raw.githubusercontent.com/lcizzle/multigravity-win-cli/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/lcizzle/multigravity-win-cli/refs/heads/main/install.ps1 | iex
 ```
 
 ---
