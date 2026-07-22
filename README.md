@@ -8,7 +8,7 @@ No more logging in and out. Launch as many profiles as you need, all at once.
 
 [![GitHub repository](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/lcizzle/multigravity-win-cli)
 [![GitHub profile](https://img.shields.io/badge/GitHub-Profile-lightgrey?logo=github)](https://github.com/lcizzle)
-[![GitHub stars](https://img.shields.io/github/stars/sujitagarwal/multigravity-cli?style=social)](https://github.com/lcizzle/multigravity-win-cli/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/lcizzle/multigravity-win-cli?style=social)](https://github.com/lcizzle/multigravity-win-cli/stargazers)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#install)
 
 ---
