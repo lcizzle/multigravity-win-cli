@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$REPO = "sujitagarwal/multigravity-cli"
+$REPO = "lcizzle/multigravity-win-cli"
 $BRANCH = "main"
 $RAW = "https://raw.githubusercontent.com/$REPO/$BRANCH"
 $INSTALL_DIR = "$env:USERPROFILE\.local\bin"
@@ -38,8 +38,8 @@ if (!$IN_PATH) {
     Write-Host ""
 }
 
-$localScript = Join-Path $PSScriptRoot "multigravity.ps1"
-if ($PSScriptRoot -and (Test-Path $localScript)) {
+$localScript = if ($PSScriptRoot) { Join-Path $PSScriptRoot "multigravity.ps1" } else { $null }
+if ($localScript -and (Test-Path $localScript)) {
     Write-Step "Installing local multigravity.ps1..."
     Copy-Item -Path $localScript -Destination "$INSTALL_DIR\multigravity.ps1" -Force
 } else {

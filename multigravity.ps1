@@ -600,7 +600,7 @@ function Invoke-DoctorCli {
 }
 
 function Invoke-UpdateCli {
-    $script_url = "https://raw.githubusercontent.com/sujitagarwal/multigravity-cli/main/multigravity.ps1"
+    $script_url = "https://raw.githubusercontent.com/lcizzle/multigravity-win-cli/main/multigravity.ps1"
     $target = $MyInvocation.MyCommand.Path
     if ([string]::IsNullOrEmpty($target)) {
         $cmdObj = Get-Command multigravity -ErrorAction SilentlyContinue
