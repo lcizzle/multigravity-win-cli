@@ -17,7 +17,7 @@ param (
     [string[]]$ForwardArgs
 )
 
-$BASE = if ($env:MULTIGRAVITY_HOME) { $env:MULTIGRAVITY_HOME } else { "$env:USERPROFILE\AntigravityProfiles" }
+$BASE = if ($env:MULTIGRAVITY_HOME) { $env:MULTIGRAVITY_HOME } else { "$env:USERPROFILE\.config\multigravity\profiles" }
 
 function Find-Antigravity {
     $paths = @(

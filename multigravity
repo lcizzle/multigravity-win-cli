@@ -3,7 +3,7 @@ set -euo pipefail
 
 shopt -s nullglob
 
-BASE="${MULTIGRAVITY_HOME:-$HOME/AntigravityProfiles}"
+BASE="${MULTIGRAVITY_HOME:-$HOME/.config/multigravity/profiles}"
 cmd="${1-}"
 
 abort() {

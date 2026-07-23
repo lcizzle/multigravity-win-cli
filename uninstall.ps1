@@ -38,7 +38,7 @@ if ($userPath -and $userPath -like "*$INSTALL_DIR*") {
 }
 
 # ── profile data (opt-in) ─────────────────────────────────────────────────────
-$profileBase = if ($env:MULTIGRAVITY_HOME) { $env:MULTIGRAVITY_HOME } else { "$env:USERPROFILE\AntigravityProfiles" }
+$profileBase = if ($env:MULTIGRAVITY_HOME) { $env:MULTIGRAVITY_HOME } else { "$env:USERPROFILE\.config\multigravity\profiles" }
 if (Test-Path $profileBase) {
     Write-Host ""
     $confirm = Read-Host "Remove all profile data at '$profileBase'? [y/N]"
