@@ -51,7 +51,11 @@ function Get-SystemExtensionsDir {
 }
 
 if (-not ([System.Management.Automation.PSTypeName]'MultigravityCredVault').Type) {
-Add-Type -ReferencedAssemblies "System.Security" -TypeDefinition @"
+    $refAssemblies = @("System.Security")
+    if ($PSEdition -eq "Core" -or $IsCoreCLR) {
+        $refAssemblies += "System.Security.Cryptography.ProtectedData"
+    }
+    Add-Type -ReferencedAssemblies $refAssemblies -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 
@@ -222,6 +226,7 @@ function Write-Usage {
     Write-Host "  update                      Update multigravity to the latest version"
     Write-Host "  doctor                      Run a system diagnosis"
     Write-Host "  stats                       Show storage usage per profile"
+    Write-Host "  shortcuts [restore]         Restore Start Menu shortcuts if they don't exist"
     Write-Host "  completion                  Show setup instructions for shell completion"
     Write-Host "  <name>                      Launch Antigravity with the given profile"
     Write-Host "  help                        Show this help"
@@ -548,6 +553,49 @@ function Invoke-ProfileStats {
     Write-Host "Total usage: $total"
 }
 
+function Invoke-RestoreShortcuts {
+    param([switch]$Force)
+
+    if (!(Test-Path $BASE)) {
+        Write-Host "No profiles found."
+        return
+    }
+
+    $profiles = Get-ChildItem -Directory -Path $BASE -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike ".*" }
+    if (!$profiles -or $profiles.Count -eq 0) {
+        Write-Host "No profiles found."
+        return
+    }
+
+    $createdCount = 0
+    $skippedCount = 0
+
+    foreach ($p in $profiles) {
+        $name = $p.Name
+        $shortcutPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Multigravity $name.lnk"
+        if ($Force -or !(Test-Path $shortcutPath)) {
+            Invoke-CreateShortcut $name
+            $createdCount++
+        } else {
+            Write-Host "Shortcut already exists: $shortcutPath"
+            $skippedCount++
+        }
+    }
+
+    Write-Host "Shortcuts restore completed ($createdCount created/restored, $skippedCount skipped)."
+}
+
+function Invoke-ShortcutsCmd {
+    param($subCmd, $extraArgs)
+
+    $force = $false
+    if ($subCmd -eq "--force" -or $subCmd -eq "-f" -or ($extraArgs -contains "--force") -or ($extraArgs -contains "-f")) {
+        $force = $true
+    }
+
+    Invoke-RestoreShortcuts -Force:$force
+}
+
 function Invoke-DoctorCli {
     $errors = 0
     $warnings = 0
@@ -641,7 +689,7 @@ function Invoke-GenerateCompletion {
         @"
 Register-ArgumentCompleter -Native -CommandName multigravity -ScriptBlock {
     param(`$wordToComplete, `$commandAst, `$cursorPosition)
-    `$opts = @('new', 'list', 'status', 'rename', 'delete', 'clone', 'template', 'export', 'import', 'update', 'doctor', 'stats', 'completion', 'help')
+    `$opts = @('new', 'list', 'status', 'rename', 'delete', 'clone', 'template', 'export', 'import', 'update', 'doctor', 'stats', 'shortcuts', 'completion', 'help')
     `$profiles = if (Test-Path '$BASE') { Get-ChildItem -Directory -Path '$BASE' | Select-Object -ExpandProperty Name } else { @() }
     (`$opts + `$profiles) | Where-Object { `$_ -like "`$wordToComplete*" } | ForEach-Object {
         [System.Management.Automation.CompletionResult]::new(`$_, `$_, 'ParameterValue', `$_)
@@ -830,6 +878,18 @@ switch ($cmd) {
     }
     "stats" {
         Invoke-ProfileStats
+    }
+    "shortcuts" {
+        $extra = @()
+        if ($arg2)       { $extra += $arg2 }
+        if ($ForwardArgs) { $extra += $ForwardArgs }
+        Invoke-ShortcutsCmd $arg1 $extra
+    }
+    "shortcut" {
+        $extra = @()
+        if ($arg2)       { $extra += $arg2 }
+        if ($ForwardArgs) { $extra += $ForwardArgs }
+        Invoke-ShortcutsCmd $arg1 $extra
     }
     "completion" {
         if ($arg1) {

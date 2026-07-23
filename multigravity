@@ -708,6 +708,73 @@ profile_stats() {
   print_info "Total usage: $total"
 }
 
+restore_shortcuts() {
+  local force=false
+  local arg
+  for arg in "$@"; do
+    if [ "$arg" = "--force" ] || [ "$arg" = "-f" ]; then
+      force=true
+    fi
+  done
+
+  if [ ! -d "$BASE" ]; then
+    print_info "No profiles found."
+    return 0
+  fi
+
+  local profiles=()
+  for p in "$BASE"/*; do
+    if [ -d "$p" ]; then
+      local bname
+      bname="$(basename "$p")"
+      case "$bname" in
+        .*) continue ;;
+      esac
+      profiles+=("$bname")
+    fi
+  done
+
+  if [ ${#profiles[@]} -eq 0 ]; then
+    print_info "No profiles found."
+    return 0
+  fi
+
+  local created_count=0
+  local skipped_count=0
+
+  for profile in "${profiles[@]}"; do
+    local target=""
+    case "$(platform)" in
+      darwin)
+        target="$(mac_shortcut_path "$profile")"
+        if [ "$force" = true ] || [ ! -d "$target" ]; then
+          create_shortcut "$profile"
+          created_count=$((created_count + 1))
+        else
+          print_info "Shortcut already exists: $target"
+          skipped_count=$((skipped_count + 1))
+        fi
+        ;;
+      linux)
+        target="$(linux_desktop_path "$profile")"
+        if [ "$force" = true ] || [ ! -f "$target" ]; then
+          create_shortcut "$profile"
+          created_count=$((created_count + 1))
+        else
+          print_info "Shortcut already exists: $target"
+          skipped_count=$((skipped_count + 1))
+        fi
+        ;;
+      *)
+        print_error "Unsupported platform for shortcuts."
+        return 1
+        ;;
+    esac
+  done
+
+  print_info "Shortcuts restore completed ($created_count created/restored, $skipped_count skipped)."
+}
+
 status_profiles() {
   if [ ! -d "$BASE" ]; then
     print_info "No profiles found."
@@ -913,6 +980,7 @@ _multigravity() {
         'update:Update multigravity'
         'doctor:Run system diagnosis'
         'stats:Show profile storage usage'
+        'shortcuts:Restore profile shortcuts'
         'completion:Setup shell completion'
         'help:Show help'
     )
@@ -946,7 +1014,7 @@ _multigravity_completions() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="new list status rename delete clone template export import update doctor stats completion help"
+    opts="new list status rename delete clone template export import update doctor stats shortcuts completion help"
 
     if [[ ${COMP_CWORD} -eq 1 ]] ; then
         local profiles=$(multigravity list --raw 2>/dev/null)
@@ -991,6 +1059,7 @@ Commands:
   update                      Update multigravity to the latest version
   doctor                      Run a system diagnosis
   stats                       Show storage usage per profile
+  shortcuts [restore]         Restore shortcuts for all profiles
   completion                  Show setup instructions for shell completion
   <name> [args...]            Launch Antigravity with the given profile
   help                        Show this help
@@ -1041,6 +1110,10 @@ case "$cmd" in
     ;;
   stats)
     profile_stats
+    ;;
+  shortcuts | shortcut)
+    shift
+    restore_shortcuts "$@"
     ;;
   completion)
     if [ -n "${2-}" ]; then

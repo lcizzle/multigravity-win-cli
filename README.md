@@ -84,6 +84,7 @@ Each profile gets an automatic clickable launcher:
 |---------|-------------|
 | `multigravity stats` | Show disk usage per profile |
 | `multigravity doctor` | Diagnose your environment |
+| `multigravity shortcuts` | Restore Start Menu / Desktop shortcuts for profiles |
 | `multigravity update` | Update Multigravity to the latest version |
 | `multigravity completion` | Set up shell tab-completion |
 | `multigravity help` | Show help |
