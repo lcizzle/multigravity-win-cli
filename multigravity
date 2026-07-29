@@ -184,6 +184,63 @@ require_app() {
   printf '%s\n' "$app"
 }
 
+find_ide_app() {
+  local override candidate
+
+  override="${MULTIGRAVITY_IDE_APP-}"
+  if [ -n "$override" ] && command_or_path "$override" >/dev/null 2>&1; then
+    command_or_path "$override"
+    return 0
+  fi
+
+  case "$(platform)" in
+    darwin)
+      for candidate in \
+        "/Applications/Antigravity IDE.app" \
+        "$HOME/Applications/Antigravity IDE.app" \
+        "/Applications/Antigravity.app" \
+        "$HOME/Applications/Antigravity.app"
+      do
+        if [ -d "$candidate" ]; then
+          printf '%s\n' "$candidate"
+          return 0
+        fi
+      done
+      ;;
+    linux)
+      for candidate in \
+        "antigravity-ide" \
+        "/usr/share/antigravity-ide/antigravity-ide" \
+        "/usr/bin/antigravity-ide" \
+        "/usr/local/bin/antigravity-ide" \
+        "$HOME/.local/bin/antigravity-ide" \
+        "antigravity" \
+        "/usr/share/antigravity/antigravity" \
+        "/usr/bin/antigravity" \
+        "/usr/local/bin/antigravity" \
+        "$HOME/.local/bin/antigravity"
+      do
+        if command_or_path "$candidate" >/dev/null 2>&1; then
+          command_or_path "$candidate"
+          return 0
+        fi
+      done
+      ;;
+  esac
+
+  return 1
+}
+
+require_ide_app() {
+  local app
+
+  if ! app="$(find_ide_app)"; then
+    abort "Antigravity IDE was not found. Install Antigravity IDE or set MULTIGRAVITY_IDE_APP."
+  fi
+
+  printf '%s\n' "$app"
+}
+
 find_cli_app() {
   local override candidate
 
@@ -470,6 +527,51 @@ launch_profile() {
   case "$(platform)" in
     darwin)
       HOME="$profile_path" open -n "$app" --args \
+        --user-data-dir "$data_dir" \
+        --extensions-dir "$ext_dir" \
+        --password-store=basic \
+        "$@"
+      ;;
+    linux)
+      HOME="$profile_path" \
+      XDG_CONFIG_HOME="$profile_path/.config" \
+      XDG_CACHE_HOME="$profile_path/.cache" \
+      XDG_DATA_HOME="$profile_path/.local/share" \
+      XDG_STATE_HOME="$profile_path/.local/state" \
+      "$app" \
+        --user-data-dir "$data_dir" \
+        --extensions-dir "$ext_dir" \
+        --password-store=basic \
+        "$@"
+      ;;
+  esac
+}
+
+launch_ide_profile() {
+  local profile=$1
+  shift || true
+
+  local profile_path
+  local data_dir
+  local ext_dir
+  local app
+
+  profile_path="$(profile_dir "$profile")"
+  if [ ! -d "$profile_path" ]; then
+    abort "profile '$profile' does not exist. Run: multigravity new $profile"
+  fi
+
+  create_profile_layout "$profile_path"
+
+  data_dir="$(user_data_dir "$profile_path")"
+  ext_dir="$(extensions_dir "$profile_path")"
+  app="$(require_ide_app)"
+
+  print_info "Launching Antigravity IDE for profile '$profile'"
+
+  case "$(platform)" in
+    darwin)
+      HOME="$profile_path" open -a "$app" -n --args \
         --user-data-dir "$data_dir" \
         --extensions-dir "$ext_dir" \
         --password-store=basic \
@@ -1196,6 +1298,14 @@ case "$cmd" in
       help_completion
     fi
     ;;
+  ide)
+    shift
+    launch_ide_profile "$@"
+    ;;
+  app | desktop)
+    shift
+    launch_profile "$@"
+    ;;
   cli | agy)
     shift
     launch_cli_profile "$@"
@@ -1209,16 +1319,21 @@ case "$cmd" in
     ;;
   *)
     has_cli=false
+    has_ide=false
     forward_args=()
     for arg in "${@:2}"; do
       if [ "$arg" = "--cli" ] || [ "$arg" = "--agy" ]; then
         has_cli=true
+      elif [ "$arg" = "--ide" ]; then
+        has_ide=true
       else
         forward_args+=("$arg")
       fi
     done
 
-    if [ "$has_cli" = true ]; then
+    if [ "$has_ide" = true ]; then
+      launch_ide_profile "$cmd" "${forward_args[@]}"
+    elif [ "$has_cli" = true ]; then
       launch_cli_profile "$cmd" "${forward_args[@]}"
     else
       launch_profile "$cmd" "${@:2}"

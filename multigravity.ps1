@@ -38,8 +38,29 @@ function Find-Antigravity {
 
 $APP = if ($env:MULTIGRAVITY_APP) { $env:MULTIGRAVITY_APP } else { Find-Antigravity }
 
+function Find-AntigravityIDE {
+    $paths = @(
+        "$env:LOCALAPPDATA\Programs\Antigravity IDE\Antigravity IDE.exe",
+        "$env:PROGRAMFILES\Antigravity IDE\Antigravity IDE.exe",
+        "${env:ProgramFiles(x86)}\Antigravity IDE\Antigravity IDE.exe",
+        "$env:LOCALAPPDATA\Programs\Antigravity IDE\bin\antigravity-ide.cmd"
+    )
+    foreach ($p in $paths) {
+        if (Test-Path $p) { return $p }
+    }
+    
+    # Try to find in PATH
+    $exeCommand = Get-Command antigravity-ide.cmd, antigravity-ide.exe -ErrorAction SilentlyContinue
+    if ($exeCommand) { return $exeCommand.Source }
+    
+    return $null
+}
+
+$IDE_APP = if ($env:MULTIGRAVITY_IDE_APP) { $env:MULTIGRAVITY_IDE_APP } else { Find-AntigravityIDE }
+
 function Find-AntigravityCLI {
     $paths = @(
+        "$env:LOCALAPPDATA\Programs\Antigravity IDE\bin\antigravity-ide.cmd",
         "$env:LOCALAPPDATA\Programs\Antigravity\bin\agy.cmd",
         "$env:LOCALAPPDATA\Programs\Antigravity\bin\agy.exe",
         "$env:PROGRAMFILES\Antigravity\bin\agy.cmd",
@@ -249,9 +270,11 @@ function Write-Usage {
     Write-Host "  stats                       Show storage usage per profile"
     Write-Host "  shortcuts [restore]         Restore Start Menu shortcuts if they don't exist"
     Write-Host "  completion                  Show setup instructions for shell completion"
+    Write-Host "  ide <name> [args]           Launch Antigravity IDE with the given profile"
     Write-Host "  cli <name> [args]           Launch Antigravity CLI (agy) with the given profile"
     Write-Host "  agy <name> [args]           Alias for cli"
-    Write-Host "  <name>                      Launch Antigravity with the given profile"
+    Write-Host "  app <name> [args]           Launch Antigravity Desktop UI with the given profile"
+    Write-Host "  <name>                      Launch Antigravity Desktop UI with the given profile"
     Write-Host "  help                        Show this help"
     Write-Host ""
     Write-Host "Profile names: alphanumeric and hyphens only (e.g. work, personal, test-1)"
@@ -328,16 +351,16 @@ function Invoke-LaunchProfile {
     }
 
     if ([string]::IsNullOrEmpty($APP) -or !(Test-Path $APP)) {
-        Write-Error "Error: Antigravity.exe not found"
+        Write-Error "Error: Antigravity Desktop App not found"
         exit 1
     }
 
-    Write-Host "Launching Antigravity profile '$PROFILE'"
+    Write-Host "Launching Antigravity Desktop App for profile '$PROFILE'"
     
     # Swap Windows Credential Manager vault entry for this profile
     Switch-CredentialToProfile $PROFILE
 
-    # Launch Antigravity with isolated USERPROFILE and explicit flags
+    # Launch Antigravity Desktop UI with isolated USERPROFILE and explicit flags
     $oldUserProfile  = $env:USERPROFILE
     $oldAppData      = $env:APPDATA
     $oldLocalAppData = $env:LOCALAPPDATA
@@ -361,6 +384,60 @@ function Invoke-LaunchProfile {
         }
 
         Start-Process -FilePath $APP -ArgumentList $launchArgs
+    } finally {
+        $env:USERPROFILE  = $oldUserProfile
+        $env:APPDATA      = $oldAppData
+        $env:LOCALAPPDATA = $oldLocalAppData
+    }
+}
+
+function Invoke-LaunchIDEProfile {
+    param($PROFILE, $ArgsToForward)
+    $PROFILE_DIR = "$BASE\$PROFILE"
+
+    if (!(Test-Path $PROFILE_DIR)) {
+        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
+        exit 1
+    }
+
+    if ([string]::IsNullOrEmpty($IDE_APP) -or !(Test-Path $IDE_APP)) {
+        Write-Error "Error: Antigravity IDE not found"
+        exit 1
+    }
+
+    Write-Host "Launching Antigravity IDE for profile '$PROFILE'"
+    
+    # Swap Windows Credential Manager vault entry for this profile
+    Switch-CredentialToProfile $PROFILE
+
+    # Launch Antigravity IDE with isolated USERPROFILE and explicit flags
+    $oldUserProfile  = $env:USERPROFILE
+    $oldAppData      = $env:APPDATA
+    $oldLocalAppData = $env:LOCALAPPDATA
+
+    try {
+        $env:USERPROFILE  = $PROFILE_DIR
+        $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
+        $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
+        
+        $userDataDir = "$PROFILE_DIR\AppData\Roaming\Antigravity"
+        $extDir = "$PROFILE_DIR\.antigravity\extensions"
+
+        $launchArgs = @(
+            "--user-data-dir", $userDataDir,
+            "--extensions-dir", $extDir,
+            "--password-store=basic"
+        )
+
+        if ($ArgsToForward) {
+            $launchArgs += $ArgsToForward
+        }
+
+        if ($IDE_APP.EndsWith(".cmd") -or $IDE_APP.EndsWith(".bat")) {
+            & $IDE_APP @launchArgs
+        } else {
+            Start-Process -FilePath $IDE_APP -ArgumentList $launchArgs
+        }
     } finally {
         $env:USERPROFILE  = $oldUserProfile
         $env:APPDATA      = $oldAppData
@@ -666,15 +743,23 @@ function Invoke-DoctorCli {
 
     Write-Host "Checking multigravity environment..."
 
-    # 1. Antigravity Installation
+    # 1. Antigravity Desktop Installation
     if ($APP -and (Test-Path $APP)) {
-        Write-Host "  [OK] Antigravity: Found at $APP"
+        Write-Host "  [OK] Antigravity Desktop App: Found at $APP"
     } else {
-        Write-Host "  [FAIL] Antigravity: Not found. Ensure it is installed or set MULTIGRAVITY_APP."
-        $errors++
+        Write-Host "  [WARN] Antigravity Desktop App: Not found. Ensure it is installed or set MULTIGRAVITY_APP."
+        $warnings++
     }
 
-    # 1b. Antigravity CLI Installation
+    # 1b. Antigravity IDE Installation
+    if ($IDE_APP -and (Test-Path $IDE_APP)) {
+        Write-Host "  [OK] Antigravity IDE: Found at $IDE_APP"
+    } else {
+        Write-Host "  [WARN] Antigravity IDE: Not found. Set MULTIGRAVITY_IDE_APP or ensure antigravity-ide is in PATH."
+        $warnings++
+    }
+
+    # 1c. Antigravity CLI Installation
     if ($CLI_APP -and (Test-Path $CLI_APP)) {
         Write-Host "  [OK] Antigravity CLI: Found at $CLI_APP"
     } else {
@@ -970,6 +1055,24 @@ switch ($cmd) {
             Invoke-HelpCompletion
         }
     }
+    "ide" {
+        $AllArgs = @()
+        if ($arg2)       { $AllArgs += $arg2 }
+        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
+        Invoke-LaunchIDEProfile $arg1 $AllArgs
+    }
+    "app" {
+        $AllArgs = @()
+        if ($arg2)       { $AllArgs += $arg2 }
+        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
+        Invoke-LaunchProfile $arg1 $AllArgs
+    }
+    "desktop" {
+        $AllArgs = @()
+        if ($arg2)       { $AllArgs += $arg2 }
+        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
+        Invoke-LaunchProfile $arg1 $AllArgs
+    }
     "cli" {
         $AllArgs = @()
         if ($arg2)       { $AllArgs += $arg2 }
@@ -995,7 +1098,10 @@ switch ($cmd) {
         if ($arg2)       { $AllArgs += $arg2 }
         if ($ForwardArgs) { $AllArgs += $ForwardArgs }
 
-        if ($AllArgs -contains "--cli" -or $AllArgs -contains "--agy") {
+        if ($AllArgs -contains "--ide") {
+            $filteredArgs = $AllArgs | Where-Object { $_ -ne "--ide" }
+            Invoke-LaunchIDEProfile $cmd $filteredArgs
+        } elseif ($AllArgs -contains "--cli" -or $AllArgs -contains "--agy") {
             $filteredArgs = $AllArgs | Where-Object { $_ -ne "--cli" -and $_ -ne "--agy" }
             Invoke-LaunchCLIProfile $cmd $filteredArgs
         } else {

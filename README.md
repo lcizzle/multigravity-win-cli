@@ -30,17 +30,21 @@ irm https://raw.githubusercontent.com/lcizzle/multigravity-win-cli/refs/heads/ma
 multigravity new work
 multigravity new personal
 
-# Launch a profile (IDE)
+# Launch a profile (Antigravity Desktop UI)
 multigravity work
+
+# Launch Antigravity IDE for a profile
+multigravity ide work
+multigravity work --ide
 
 # Launch Antigravity CLI (agy) for a profile
 multigravity cli work
 multigravity work --cli
 
-# Pass arguments straight through to Antigravity IDE or CLI
-multigravity work .
-multigravity work path/to/project
-multigravity work --new-window
+# Pass arguments straight through to Antigravity IDE, Desktop App, or CLI
+multigravity ide work .
+multigravity ide work path/to/project
+multigravity ide work --new-window
 multigravity cli work --help
 ```
 
@@ -61,7 +65,9 @@ Each profile gets an automatic clickable launcher:
 | `multigravity new <name>` | Create a new full profile |
 | `multigravity new <name> --shared` | Create a lightweight profile (shared extensions & settings, isolated accounts) |
 | `multigravity new <name> --from <template>` | Create a profile from a saved template |
-| `multigravity <name>` | Launch a profile in Antigravity IDE |
+| `multigravity <name>` | Launch a profile in Antigravity Desktop App |
+| `multigravity app <name>` | Launch a profile in Antigravity Desktop App |
+| `multigravity ide <name> [args]` | Launch a profile in Antigravity IDE |
 | `multigravity cli <name> [args]` | Launch Antigravity CLI (`agy`) with isolated profile state |
 | `multigravity agy <name> [args]` | Alias for `multigravity cli` |
 | `multigravity list` | List all profiles |
