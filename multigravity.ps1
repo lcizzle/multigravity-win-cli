@@ -30,8 +30,11 @@ function Find-Antigravity {
     }
     
     # Try to find in PATH
-    $exeCommand = Get-Command antigravity.exe -ErrorAction SilentlyContinue
-    if ($exeCommand) { return $exeCommand.Source }
+    $exeCommand = Get-Command antigravity.exe, antigravity -ErrorAction SilentlyContinue
+    if ($exeCommand) {
+        if ($exeCommand -is [array]) { return $exeCommand[0].Source }
+        return $exeCommand.Source
+    }
     
     return $null
 }
@@ -50,8 +53,11 @@ function Find-AntigravityIDE {
     }
     
     # Try to find in PATH
-    $exeCommand = Get-Command antigravity-ide.cmd, antigravity-ide.exe -ErrorAction SilentlyContinue
-    if ($exeCommand) { return $exeCommand.Source }
+    $exeCommand = Get-Command antigravity-ide.cmd, antigravity-ide.exe, antigravity-ide -ErrorAction SilentlyContinue
+    if ($exeCommand) {
+        if ($exeCommand -is [array]) { return $exeCommand[0].Source }
+        return $exeCommand.Source
+    }
     
     return $null
 }
@@ -60,12 +66,17 @@ $IDE_APP = if ($env:MULTIGRAVITY_IDE_APP) { $env:MULTIGRAVITY_IDE_APP } else { F
 
 function Find-AntigravityCLI {
     $paths = @(
-        "$env:LOCALAPPDATA\Programs\Antigravity IDE\bin\antigravity-ide.cmd",
         "$env:LOCALAPPDATA\Programs\Antigravity\bin\agy.cmd",
         "$env:LOCALAPPDATA\Programs\Antigravity\bin\agy.exe",
+        "$env:LOCALAPPDATA\Programs\Antigravity CLI\bin\agy.cmd",
+        "$env:LOCALAPPDATA\Programs\Antigravity CLI\bin\agy.exe",
+        "$env:LOCALAPPDATA\Programs\Antigravity CLI\agy.exe",
         "$env:PROGRAMFILES\Antigravity\bin\agy.cmd",
         "$env:PROGRAMFILES\Antigravity\bin\agy.exe",
-        "${env:ProgramFiles(x86)}\Antigravity\bin\agy.cmd"
+        "$env:PROGRAMFILES\Antigravity CLI\bin\agy.cmd",
+        "$env:PROGRAMFILES\Antigravity CLI\bin\agy.exe",
+        "${env:ProgramFiles(x86)}\Antigravity\bin\agy.cmd",
+        "${env:ProgramFiles(x86)}\Antigravity\bin\agy.exe"
     )
     foreach ($p in $paths) {
         if (Test-Path $p) { return $p }
@@ -73,7 +84,10 @@ function Find-AntigravityCLI {
     
     # Try to find in PATH
     $cmdObj = Get-Command agy.cmd, agy.exe, agy -ErrorAction SilentlyContinue
-    if ($cmdObj) { return $cmdObj.Source }
+    if ($cmdObj) {
+        if ($cmdObj -is [array]) { return $cmdObj[0].Source }
+        return $cmdObj.Source
+    }
     
     return $null
 }
