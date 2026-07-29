@@ -38,6 +38,27 @@ function Find-Antigravity {
 
 $APP = if ($env:MULTIGRAVITY_APP) { $env:MULTIGRAVITY_APP } else { Find-Antigravity }
 
+function Find-AntigravityCLI {
+    $paths = @(
+        "$env:LOCALAPPDATA\Programs\Antigravity\bin\agy.cmd",
+        "$env:LOCALAPPDATA\Programs\Antigravity\bin\agy.exe",
+        "$env:PROGRAMFILES\Antigravity\bin\agy.cmd",
+        "$env:PROGRAMFILES\Antigravity\bin\agy.exe",
+        "${env:ProgramFiles(x86)}\Antigravity\bin\agy.cmd"
+    )
+    foreach ($p in $paths) {
+        if (Test-Path $p) { return $p }
+    }
+    
+    # Try to find in PATH
+    $cmdObj = Get-Command agy.cmd, agy.exe, agy -ErrorAction SilentlyContinue
+    if ($cmdObj) { return $cmdObj.Source }
+    
+    return $null
+}
+
+$CLI_APP = if ($env:MULTIGRAVITY_CLI_APP) { $env:MULTIGRAVITY_CLI_APP } else { Find-AntigravityCLI }
+
 function Get-TemplatesDir {
     return "$BASE\.templates"
 }
@@ -228,6 +249,8 @@ function Write-Usage {
     Write-Host "  stats                       Show storage usage per profile"
     Write-Host "  shortcuts [restore]         Restore Start Menu shortcuts if they don't exist"
     Write-Host "  completion                  Show setup instructions for shell completion"
+    Write-Host "  cli <name> [args]           Launch Antigravity CLI (agy) with the given profile"
+    Write-Host "  agy <name> [args]           Alias for cli"
     Write-Host "  <name>                      Launch Antigravity with the given profile"
     Write-Host "  help                        Show this help"
     Write-Host ""
@@ -338,6 +361,47 @@ function Invoke-LaunchProfile {
         }
 
         Start-Process -FilePath $APP -ArgumentList $launchArgs
+    } finally {
+        $env:USERPROFILE  = $oldUserProfile
+        $env:APPDATA      = $oldAppData
+        $env:LOCALAPPDATA = $oldLocalAppData
+    }
+}
+
+function Invoke-LaunchCLIProfile {
+    param($PROFILE, $ArgsToForward)
+    $PROFILE_DIR = "$BASE\$PROFILE"
+
+    if (!(Test-Path $PROFILE_DIR)) {
+        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
+        exit 1
+    }
+
+    if ([string]::IsNullOrEmpty($CLI_APP) -or !(Test-Path $CLI_APP)) {
+        Write-Error "Error: Antigravity CLI (agy) not found"
+        exit 1
+    }
+
+    Write-Host "Launching Antigravity CLI for profile '$PROFILE'"
+    
+    # Swap Windows Credential Manager vault entry for this profile
+    Switch-CredentialToProfile $PROFILE
+
+    # Launch agy with isolated USERPROFILE
+    $oldUserProfile  = $env:USERPROFILE
+    $oldAppData      = $env:APPDATA
+    $oldLocalAppData = $env:LOCALAPPDATA
+
+    try {
+        $env:USERPROFILE  = $PROFILE_DIR
+        $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
+        $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
+
+        if ($ArgsToForward) {
+            & $CLI_APP @ArgsToForward
+        } else {
+            & $CLI_APP
+        }
     } finally {
         $env:USERPROFILE  = $oldUserProfile
         $env:APPDATA      = $oldAppData
@@ -608,6 +672,14 @@ function Invoke-DoctorCli {
     } else {
         Write-Host "  [FAIL] Antigravity: Not found. Ensure it is installed or set MULTIGRAVITY_APP."
         $errors++
+    }
+
+    # 1b. Antigravity CLI Installation
+    if ($CLI_APP -and (Test-Path $CLI_APP)) {
+        Write-Host "  [OK] Antigravity CLI: Found at $CLI_APP"
+    } else {
+        Write-Host "  [WARN] Antigravity CLI: 'agy' not found. Set MULTIGRAVITY_CLI_APP or ensure agy is in PATH."
+        $warnings++
     }
 
     # 2. Path Check
@@ -898,6 +970,18 @@ switch ($cmd) {
             Invoke-HelpCompletion
         }
     }
+    "cli" {
+        $AllArgs = @()
+        if ($arg2)       { $AllArgs += $arg2 }
+        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
+        Invoke-LaunchCLIProfile $arg1 $AllArgs
+    }
+    "agy" {
+        $AllArgs = @()
+        if ($arg2)       { $AllArgs += $arg2 }
+        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
+        Invoke-LaunchCLIProfile $arg1 $AllArgs
+    }
     "help"   { Write-Usage }
     "--help" { Write-Usage }
     "-h"     { Write-Usage }
@@ -910,6 +994,12 @@ switch ($cmd) {
         if ($arg1)       { $AllArgs += $arg1 }
         if ($arg2)       { $AllArgs += $arg2 }
         if ($ForwardArgs) { $AllArgs += $ForwardArgs }
-        Invoke-LaunchProfile $cmd $AllArgs
+
+        if ($AllArgs -contains "--cli" -or $AllArgs -contains "--agy") {
+            $filteredArgs = $AllArgs | Where-Object { $_ -ne "--cli" -and $_ -ne "--agy" }
+            Invoke-LaunchCLIProfile $cmd $filteredArgs
+        } else {
+            Invoke-LaunchProfile $cmd $AllArgs
+        }
     }
 }

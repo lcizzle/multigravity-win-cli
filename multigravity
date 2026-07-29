@@ -184,6 +184,35 @@ require_app() {
   printf '%s\n' "$app"
 }
 
+find_cli_app() {
+  local override candidate
+
+  override="${MULTIGRAVITY_CLI_APP-}"
+  if [ -n "$override" ] && command_or_path "$override" >/dev/null 2>&1; then
+    command_or_path "$override"
+    return 0
+  fi
+
+  for candidate in "agy" "/usr/local/bin/agy" "/usr/bin/agy" "$HOME/.local/bin/agy"; do
+    if command_or_path "$candidate" >/dev/null 2>&1; then
+      command_or_path "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+require_cli_app() {
+  local app
+
+  if ! app="$(find_cli_app)"; then
+    abort "Antigravity CLI (agy) was not found. Install agy so it is on PATH, or set MULTIGRAVITY_CLI_APP."
+  fi
+
+  printf '%s\n' "$app"
+}
+
 create_profile_layout() {
   local profile_path=$1
 
@@ -461,6 +490,39 @@ launch_profile() {
   esac
 }
 
+launch_cli_profile() {
+  local profile=$1
+  shift || true
+
+  local profile_path
+  local app
+
+  profile_path="$(profile_dir "$profile")"
+  if [ ! -d "$profile_path" ]; then
+    abort "profile '$profile' does not exist. Run: multigravity new $profile"
+  fi
+
+  create_profile_layout "$profile_path"
+
+  app="$(require_cli_app)"
+
+  print_info "Launching Antigravity CLI for profile '$profile'"
+
+  case "$(platform)" in
+    darwin)
+      HOME="$profile_path" "$app" "$@"
+      ;;
+    linux)
+      HOME="$profile_path" \
+      XDG_CONFIG_HOME="$profile_path/.config" \
+      XDG_CACHE_HOME="$profile_path/.cache" \
+      XDG_DATA_HOME="$profile_path/.local/share" \
+      XDG_STATE_HOME="$profile_path/.local/state" \
+      "$app" "$@"
+      ;;
+  esac
+}
+
 list_profiles() {
   local entries=""
   local dir
@@ -627,6 +689,15 @@ doctor_cli() {
   else
     echo "  [✗] Antigravity: Not found. Ensure it is installed or set MULTIGRAVITY_APP."
     errors=$((errors + 1))
+  fi
+
+  # 2b. Antigravity CLI Installation
+  local cli_app
+  if cli_app=$(find_cli_app); then
+    echo "  [✓] Antigravity CLI: Found at $cli_app"
+  else
+    echo "  [!] Antigravity CLI: 'agy' not found. Set MULTIGRAVITY_CLI_APP or ensure agy is in PATH."
+    warnings=$((warnings + 1))
   fi
 
   # 3. Path Check
@@ -1061,6 +1132,8 @@ Commands:
   stats                       Show storage usage per profile
   shortcuts [restore]         Restore shortcuts for all profiles
   completion                  Show setup instructions for shell completion
+  cli <name> [args...]        Launch Antigravity CLI (agy) with the given profile
+  agy <name> [args...]        Alias for cli
   <name> [args...]            Launch Antigravity with the given profile
   help                        Show this help
 
@@ -1068,6 +1141,7 @@ Profile names: alphanumeric and hyphens only (e.g. work, personal, test-1)
 
 Environment:
   MULTIGRAVITY_APP      Override the Antigravity app path or command
+  MULTIGRAVITY_CLI_APP  Override the Antigravity CLI (agy) path or command
   MULTIGRAVITY_HOME     Override the profile storage directory
 EOF
 }
@@ -1122,6 +1196,10 @@ case "$cmd" in
       help_completion
     fi
     ;;
+  cli | agy)
+    shift
+    launch_cli_profile "$@"
+    ;;
   help | --help | -h)
     usage
     ;;
@@ -1130,6 +1208,20 @@ case "$cmd" in
     exit 1
     ;;
   *)
-    launch_profile "$cmd" "${@:2}"
+    has_cli=false
+    forward_args=()
+    for arg in "${@:2}"; do
+      if [ "$arg" = "--cli" ] || [ "$arg" = "--agy" ]; then
+        has_cli=true
+      else
+        forward_args+=("$arg")
+      fi
+    done
+
+    if [ "$has_cli" = true ]; then
+      launch_cli_profile "$cmd" "${forward_args[@]}"
+    else
+      launch_profile "$cmd" "${@:2}"
+    fi
     ;;
 esac
