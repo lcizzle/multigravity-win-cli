@@ -15,6 +15,10 @@ print_info() {
   echo "$1"
 }
 
+print_warning() {
+  echo "Warning: $1" >&2
+}
+
 platform() {
   local raw
   raw="${MULTIGRAVITY_PLATFORM-}"
@@ -67,6 +71,13 @@ extensions_dir() {
   printf '%s/.antigravity/extensions\n' "$profile_path"
 }
 
+get_global_profile() {
+  local global_file="$BASE/.global_profile"
+  if [ -f "$global_file" ]; then
+    cat "$global_file" | tr -d '\r\n'
+  fi
+}
+
 system_user_data_dir() {
   case "$(platform)" in
     darwin) printf '%s/Library/Application Support/Antigravity\n' "$HOME" ;;
@@ -76,6 +87,10 @@ system_user_data_dir() {
 
 system_extensions_dir() {
   printf '%s/.antigravity/extensions\n' "$HOME"
+}
+
+system_gemini_dir() {
+  printf '%s/.gemini\n' "$HOME"
 }
 
 linux_launcher_dir() {
@@ -184,63 +199,6 @@ require_app() {
   printf '%s\n' "$app"
 }
 
-find_ide_app() {
-  local override candidate
-
-  override="${MULTIGRAVITY_IDE_APP-}"
-  if [ -n "$override" ] && command_or_path "$override" >/dev/null 2>&1; then
-    command_or_path "$override"
-    return 0
-  fi
-
-  case "$(platform)" in
-    darwin)
-      for candidate in \
-        "/Applications/Antigravity IDE.app" \
-        "$HOME/Applications/Antigravity IDE.app" \
-        "/Applications/Antigravity.app" \
-        "$HOME/Applications/Antigravity.app"
-      do
-        if [ -d "$candidate" ]; then
-          printf '%s\n' "$candidate"
-          return 0
-        fi
-      done
-      ;;
-    linux)
-      for candidate in \
-        "antigravity-ide" \
-        "/usr/share/antigravity-ide/antigravity-ide" \
-        "/usr/bin/antigravity-ide" \
-        "/usr/local/bin/antigravity-ide" \
-        "$HOME/.local/bin/antigravity-ide" \
-        "antigravity" \
-        "/usr/share/antigravity/antigravity" \
-        "/usr/bin/antigravity" \
-        "/usr/local/bin/antigravity" \
-        "$HOME/.local/bin/antigravity"
-      do
-        if command_or_path "$candidate" >/dev/null 2>&1; then
-          command_or_path "$candidate"
-          return 0
-        fi
-      done
-      ;;
-  esac
-
-  return 1
-}
-
-require_ide_app() {
-  local app
-
-  if ! app="$(find_ide_app)"; then
-    abort "Antigravity IDE was not found. Install Antigravity IDE or set MULTIGRAVITY_IDE_APP."
-  fi
-
-  printf '%s\n' "$app"
-}
-
 find_cli_app() {
   local override candidate
 
@@ -275,6 +233,12 @@ create_profile_layout() {
 
   mkdir -p "$profile_path"
   mkdir -p "$(extensions_dir "$profile_path")"
+  mkdir -p "$profile_path/.gemini/antigravity"
+  mkdir -p "$profile_path/.gemini/antigravity-cli"
+  mkdir -p "$profile_path/.gemini/antigravity-ide"
+  mkdir -p "$profile_path/.gemini/config"
+  mkdir -p "$profile_path/AppData/Roaming"
+  mkdir -p "$profile_path/AppData/Local"
 
   case "$(platform)" in
     darwin)
@@ -294,39 +258,116 @@ create_profile_layout() {
   esac
 }
 
-create_shared_layout() {
-  local profile_path=$1
-  local sys_data sys_ext data_dir ext_dir
+sync_shared_profile() {
+  local profile_name=$1
+  if ! is_shared_profile "$profile_name"; then
+    return 0
+  fi
 
-  sys_data="$(system_user_data_dir)"
+  local profile_path sys_gemini
+  profile_path="$(profile_dir "$profile_name")"
+  sys_gemini="$(system_gemini_dir)"
+
+  # Extensions symlink for Desktop App
+  local sys_ext ext_dir
   sys_ext="$(system_extensions_dir)"
+  ext_dir="$(extensions_dir "$profile_path")"
+  mkdir -p "$(dirname "$ext_dir")"
+  mkdir -p "$sys_ext"
+  if [ ! -L "$ext_dir" ] || [ "$(readlink "$ext_dir")" != "$sys_ext" ]; then
+    rm -rf "$ext_dir"
+    ln -s "$sys_ext" "$ext_dir" || print_warning "Failed to create extensions symlink for shared profile '$profile_name'."
+  fi
 
-  mkdir -p "$profile_path"
-  touch "$profile_path/.shared"
-
-  # Isolated user-data dir so accounts stay separate
-  data_dir="$(user_data_dir "$profile_path")"
-  mkdir -p "$data_dir/User"
-
-  # Point settings/keybindings/snippets at the system install (read-only intent)
-  if [ -d "$sys_data/User" ]; then
-    local f
-    for f in settings.json keybindings.json snippets; do
-      if [ -e "$sys_data/User/$f" ] && [ ! -e "$data_dir/User/$f" ]; then
-        ln -s "$sys_data/User/$f" "$data_dir/User/$f"
+  # .gemini subdirectories direct symlinks
+  if [ -d "$sys_gemini" ]; then
+    local prof_gemini="$profile_path/.gemini"
+    mkdir -p "$prof_gemini"
+    local sub
+    for sub in antigravity antigravity-cli antigravity-ide config; do
+      local src_sub="$sys_gemini/$sub"
+      local dest_sub="$prof_gemini/$sub"
+      if [ -d "$src_sub" ]; then
+        if [ ! -L "$dest_sub" ] || [ "$(readlink "$dest_sub")" != "$src_sub" ]; then
+          rm -rf "$dest_sub"
+          ln -s "$src_sub" "$dest_sub" || print_warning "Failed to create .gemini/$sub symlink for shared profile '$profile_name'."
+        fi
       fi
     done
   fi
 
-  # Share the system extensions directory rather than an empty copy
-  ext_dir="$(extensions_dir "$profile_path")"
-  mkdir -p "$(dirname "$ext_dir")"
-  if [ -d "$sys_ext" ]; then
-    rm -rf "$ext_dir"
-    ln -s "$sys_ext" "$ext_dir"
-  else
-    mkdir -p "$ext_dir"
-  fi
+  local sys_data_dir="$(system_user_data_dir)"
+  local prof_data_dir="$(user_data_dir "$profile_path")"
+
+  mkdir -p "$sys_data_dir/User"
+  mkdir -p "$prof_data_dir/User"
+
+  local f
+  for f in settings.json keybindings.json snippets tasks.json; do
+    local src="$sys_data_dir/User/$f"
+    local dest="$prof_data_dir/User/$f"
+
+    if [ "$f" = "snippets" ]; then
+      mkdir -p "$src"
+    elif [ ! -e "$src" ]; then
+      mkdir -p "$(dirname "$src")"
+      printf '{}\n' > "$src"
+    fi
+
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      if [ -L "$dest" ]; then
+        local current_target
+        current_target="$(readlink "$dest")"
+        if [ "$current_target" = "$src" ]; then
+          continue
+        fi
+      fi
+      rm -rf "$dest"
+    fi
+
+    ln -s "$src" "$dest" || print_warning "Failed to link '$f' for shared profile '$profile_name'."
+  done
+
+  # globalStorage non-auth sync
+  local sys_gs="$sys_data_dir/User/globalStorage"
+  local prof_gs="$prof_data_dir/User/globalStorage"
+  mkdir -p "$sys_gs"
+  mkdir -p "$prof_gs"
+
+  for item in "$sys_gs"/*; do
+    [ -e "$item" ] || continue
+    local base="$(basename "$item")"
+    case "$base" in
+      state.vscdb|state.vscdb.backup|storage.json|secrets.json)
+        continue
+        ;;
+      *)
+        local dest_item="$prof_gs/$base"
+        if [ -e "$dest_item" ] || [ -L "$dest_item" ]; then
+          if [ -L "$dest_item" ]; then
+            local current_target
+            current_target="$(readlink "$dest_item")"
+            if [ "$current_target" = "$item" ]; then
+              continue
+            fi
+          fi
+          rm -rf "$dest_item"
+        fi
+        ln -s "$item" "$dest_item" || print_warning "Failed to link '$base' for shared profile '$profile_name'."
+        ;;
+    esac
+  done
+}
+
+create_shared_layout() {
+  local profile_path=$1
+  local profile_name
+  profile_name="$(basename "$profile_path")"
+
+  mkdir -p "$profile_path"
+  touch "$profile_path/.shared"
+
+  sync_shared_profile "$profile_name"
 
   case "$(platform)" in
     darwin)
@@ -517,6 +558,7 @@ launch_profile() {
   fi
 
   create_profile_layout "$profile_path"
+  sync_shared_profile "$profile"
 
   app="$(require_app)"
   data_dir="$(user_data_dir "$profile_path")"
@@ -547,50 +589,6 @@ launch_profile() {
   esac
 }
 
-launch_ide_profile() {
-  local profile=$1
-  shift || true
-
-  local profile_path
-  local data_dir
-  local ext_dir
-  local app
-
-  profile_path="$(profile_dir "$profile")"
-  if [ ! -d "$profile_path" ]; then
-    abort "profile '$profile' does not exist. Run: multigravity new $profile"
-  fi
-
-  create_profile_layout "$profile_path"
-
-  data_dir="$(user_data_dir "$profile_path")"
-  ext_dir="$(extensions_dir "$profile_path")"
-  app="$(require_ide_app)"
-
-  print_info "Launching Antigravity IDE for profile '$profile'"
-
-  case "$(platform)" in
-    darwin)
-      HOME="$profile_path" open -a "$app" -n --args \
-        --user-data-dir "$data_dir" \
-        --extensions-dir "$ext_dir" \
-        --password-store=basic \
-        "$@"
-      ;;
-    linux)
-      HOME="$profile_path" \
-      XDG_CONFIG_HOME="$profile_path/.config" \
-      XDG_CACHE_HOME="$profile_path/.cache" \
-      XDG_DATA_HOME="$profile_path/.local/share" \
-      XDG_STATE_HOME="$profile_path/.local/state" \
-      "$app" \
-        --user-data-dir "$data_dir" \
-        --extensions-dir "$ext_dir" \
-        --password-store=basic \
-        "$@"
-      ;;
-  esac
-}
 
 launch_cli_profile() {
   local profile=$1
@@ -605,6 +603,7 @@ launch_cli_profile() {
   fi
 
   create_profile_layout "$profile_path"
+  sync_shared_profile "$profile"
 
   app="$(require_cli_app)"
 
@@ -766,6 +765,10 @@ clone_profile() {
 
   print_info "Cloning profile '$src' to '$dest'..."
   cp -R "$src_path" "$dest_path"
+  if is_shared_profile "$src"; then
+    touch "$dest_path/.shared"
+    sync_shared_profile "$dest"
+  fi
   create_shortcut "$dest"
 
   print_info "Successfully cloned '$src' to '$dest'"
@@ -1298,10 +1301,6 @@ case "$cmd" in
       help_completion
     fi
     ;;
-  ide)
-    shift
-    launch_ide_profile "$@"
-    ;;
   app | desktop)
     shift
     launch_profile "$@"
@@ -1319,21 +1318,16 @@ case "$cmd" in
     ;;
   *)
     has_cli=false
-    has_ide=false
     forward_args=()
     for arg in "${@:2}"; do
       if [ "$arg" = "--cli" ] || [ "$arg" = "--agy" ]; then
         has_cli=true
-      elif [ "$arg" = "--ide" ]; then
-        has_ide=true
       else
         forward_args+=("$arg")
       fi
     done
 
-    if [ "$has_ide" = true ]; then
-      launch_ide_profile "$cmd" "${forward_args[@]}"
-    elif [ "$has_cli" = true ]; then
+    if [ "$has_cli" = true ]; then
       launch_cli_profile "$cmd" "${forward_args[@]}"
     else
       launch_profile "$cmd" "${@:2}"

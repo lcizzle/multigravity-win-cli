@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Run multiple Antigravity IDE profiles at the same time.
+Run multiple Antigravity profiles at the same time.
 #>
 
 param (
@@ -40,29 +40,6 @@ function Find-Antigravity {
 }
 
 $APP = if ($env:MULTIGRAVITY_APP) { $env:MULTIGRAVITY_APP } else { Find-Antigravity }
-
-function Find-AntigravityIDE {
-    $paths = @(
-        "$env:LOCALAPPDATA\Programs\Antigravity IDE\Antigravity IDE.exe",
-        "$env:PROGRAMFILES\Antigravity IDE\Antigravity IDE.exe",
-        "${env:ProgramFiles(x86)}\Antigravity IDE\Antigravity IDE.exe",
-        "$env:LOCALAPPDATA\Programs\Antigravity IDE\bin\antigravity-ide.cmd"
-    )
-    foreach ($p in $paths) {
-        if (Test-Path $p) { return $p }
-    }
-    
-    # Try to find in PATH
-    $exeCommand = Get-Command antigravity-ide.cmd, antigravity-ide.exe, antigravity-ide -ErrorAction SilentlyContinue
-    if ($exeCommand) {
-        if ($exeCommand -is [array]) { return $exeCommand[0].Source }
-        return $exeCommand.Source
-    }
-    
-    return $null
-}
-
-$IDE_APP = if ($env:MULTIGRAVITY_IDE_APP) { $env:MULTIGRAVITY_IDE_APP } else { Find-AntigravityIDE }
 
 function Find-AntigravityCLI {
     $paths = @(
@@ -104,6 +81,10 @@ function Get-SystemDataDir {
 
 function Get-SystemExtensionsDir {
     return "$env:USERPROFILE\.antigravity\extensions"
+}
+
+function Get-SystemGeminiDir {
+    return "$env:USERPROFILE\.gemini"
 }
 
 if (-not ([System.Management.Automation.PSTypeName]'MultigravityCredVault').Type) {
@@ -237,6 +218,13 @@ function Set-GlobalProfile {
     Write-Host "Set global profile name to '$PROFILE'"
 
     Invoke-CreateShortcut $PROFILE
+
+    if (Test-Path $BASE) {
+        $sharedProfiles = Get-ChildItem -Directory -Path $BASE -ErrorAction SilentlyContinue | Where-Object { Test-Path "$($_.FullName)\.shared" }
+        foreach ($sp in $sharedProfiles) {
+            Sync-SharedProfile $sp.Name
+        }
+    }
 }
 
 function Unset-GlobalProfile {
@@ -485,7 +473,6 @@ function Write-Usage {
     Write-Host "  stats                       Show storage usage per profile"
     Write-Host "  shortcuts [restore]         Restore Start Menu shortcuts if they don't exist"
     Write-Host "  completion                  Show setup instructions for shell completion"
-    Write-Host "  ide <name> [args]           Launch Antigravity IDE with the given profile"
     Write-Host "  cli <name> [args]           Launch Antigravity CLI (agy) with the given profile"
     Write-Host "  agy <name> [args]           Alias for cli"
     Write-Host "  app <name> [args]           Launch Antigravity Desktop UI with the given profile"
@@ -512,48 +499,183 @@ function Invoke-CreateProfile {
     $PROFILE_DIR = "$BASE\$PROFILE"
     
     New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\.antigravity\extensions" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\.gemini\antigravity" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\.gemini\antigravity-cli" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\.gemini\antigravity-ide" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\.gemini\config" | Out-Null
     New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\AppData\Roaming" | Out-Null
     New-Item -ItemType Directory -Force -Path "$PROFILE_DIR\AppData\Local" | Out-Null
 }
 
-function Invoke-CreateSharedProfile {
+function New-SharedFileLink {
+    param(
+        [string]$src,
+        [string]$dest
+    )
+
+    $destParent = Split-Path $dest
+    if (!(Test-Path $destParent)) {
+        New-Item -ItemType Directory -Force -Path $destParent | Out-Null
+    }
+
+    $srcParent = Split-Path $src
+    if (!(Test-Path $srcParent)) {
+        New-Item -ItemType Directory -Force -Path $srcParent | Out-Null
+    }
+
+    if (!(Test-Path $src)) {
+        Set-Content -Path $src -Value "{}`n" -Encoding UTF8
+    }
+
+    if (Test-Path $dest) {
+        $item = Get-Item $dest -ErrorAction SilentlyContinue
+        if ($item) {
+            if ($item.LinkType -eq "SymbolicLink" -or $item.Attributes -match "ReparsePoint") {
+                if ($item.Target -contains $src -or $item.Target -eq $src) {
+                    return $true
+                }
+            }
+        }
+        Remove-Item -Force $dest -ErrorAction SilentlyContinue
+    }
+
+    $linked = $false
+    try {
+        New-Item -ItemType SymbolicLink -Path $dest -Target $src -ErrorAction Stop | Out-Null
+        $linked = $true
+    } catch {
+        try {
+            New-Item -ItemType HardLink -Path $dest -Target $src -ErrorAction Stop | Out-Null
+            $linked = $true
+        } catch {}
+    }
+
+    return $linked
+}
+
+function New-SharedDirJunction {
+    param(
+        [string]$src,
+        [string]$dest
+    )
+
+    $destParent = Split-Path $dest
+    if (!(Test-Path $destParent)) {
+        New-Item -ItemType Directory -Force -Path $destParent | Out-Null
+    }
+
+    if (!(Test-Path $src)) {
+        New-Item -ItemType Directory -Force -Path $src | Out-Null
+    }
+
+    if (Test-Path $dest) {
+        $item = Get-Item $dest -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -match "ReparsePoint" -or $item.LinkType -eq "Junction" -or $item.LinkType -eq "SymbolicLink")) {
+            if ($item.Target -contains $src -or $item.Target -eq $src) {
+                return $true
+            }
+        }
+        Remove-Item -Force -Recurse $dest -ErrorAction SilentlyContinue
+    }
+
+    try {
+        New-Item -ItemType Junction -Path $dest -Target $src -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Sync-SharedProfile {
     param($name)
+    if (!(Test-SharedProfile $name)) { return }
+
     $profileDir = "$BASE\$name"
     $sysData     = Get-SystemDataDir
     $sysExt      = Get-SystemExtensionsDir
+    $sysGemini   = Get-SystemGeminiDir
 
-    New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
-    New-Item -ItemType File      -Force -Path "$profileDir\.shared" | Out-Null
-
-    # Isolated AppData so accounts don't bleed across profiles
     $userDataDir = "$profileDir\AppData\Roaming\Antigravity\User"
-    New-Item -ItemType Directory -Force -Path $userDataDir | Out-Null
-    New-Item -ItemType Directory -Force -Path "$profileDir\AppData\Local" | Out-Null
+    if (!(Test-Path $userDataDir)) {
+        New-Item -ItemType Directory -Force -Path $userDataDir | Out-Null
+    }
+    if (!(Test-Path "$profileDir\AppData\Local")) {
+        New-Item -ItemType Directory -Force -Path "$profileDir\AppData\Local" | Out-Null
+    }
 
-    # Symlink settings files from the system install so they stay in sync
-    if (Test-Path "$sysData\User") {
-        foreach ($f in @("settings.json", "keybindings.json", "snippets")) {
-            $src  = "$sysData\User\$f"
-            $dest = "$userDataDir\$f"
-            if ((Test-Path $src) -and !(Test-Path $dest)) {
-                if ((Get-Item $src).PSIsContainer) {
-                    New-Item -ItemType Junction -Path $dest -Target $src -ErrorAction SilentlyContinue | Out-Null
-                } else {
-                    New-Item -ItemType SymbolicLink -Path $dest -Target $src -ErrorAction SilentlyContinue | Out-Null
+    # 1. Share extensions via Junction
+    $extDir = "$profileDir\.antigravity\extensions"
+    if (!(New-SharedDirJunction -src $sysExt -dest $extDir)) {
+        Write-Warning "Failed to create extensions junction for shared profile '$name'. Shared profiles require directory junction creation privileges."
+    }
+
+    # 2. Share .gemini subdirectories directly via Junctions
+    if (Test-Path $sysGemini) {
+        $profGeminiDir = "$profileDir\.gemini"
+        if (!(Test-Path $profGeminiDir)) {
+            New-Item -ItemType Directory -Force -Path $profGeminiDir | Out-Null
+        }
+        foreach ($sub in @("antigravity", "antigravity-cli", "antigravity-ide", "config")) {
+            $srcSub  = "$sysGemini\$sub"
+            $destSub = "$profGeminiDir\$sub"
+            if (Test-Path $srcSub) {
+                if (!(New-SharedDirJunction -src $srcSub -dest $destSub)) {
+                    Write-Warning "Failed to create .gemini\$sub junction for shared profile '$name'."
                 }
             }
         }
     }
 
-    # Point extensions at the system folder instead of an empty private copy
-    $extDir = "$profileDir\.antigravity\extensions"
-    if (Test-Path $sysExt) {
-        if (Test-Path $extDir) { Remove-Item $extDir -Force -ErrorAction SilentlyContinue }
-        New-Item -ItemType Directory -Force -Path "$profileDir\.antigravity" | Out-Null
-        New-Item -ItemType Junction -Path $extDir -Target $sysExt -ErrorAction SilentlyContinue | Out-Null
-    } else {
-        New-Item -ItemType Directory -Force -Path $extDir | Out-Null
+    # 3. Share Settings, Keybindings, Snippets, Tasks
+    foreach ($f in @("settings.json", "keybindings.json", "snippets", "tasks.json")) {
+        $src  = "$sysData\User\$f"
+        $dest = "$userDataDir\$f"
+
+        if ($f -eq "snippets") {
+            if (!(New-SharedDirJunction -src $src -dest $dest)) {
+                Write-Warning "Failed to create junction for '$f' in shared profile '$name'."
+            }
+        } else {
+            if (!(New-SharedFileLink -src $src -dest $dest)) {
+                Write-Warning "Failed to link '$f' for shared profile '$name'. Shared profiles require Administrator privileges or Developer Mode on Windows."
+            }
+        }
     }
+
+    # 4. Share Global Storage (extension configuration & data, keeping login account & auth session DBs isolated)
+    $sysGlobalStorage = "$sysData\User\globalStorage"
+    $profGlobalStorage = "$userDataDir\globalStorage"
+    if (!(Test-Path $sysGlobalStorage)) {
+        New-Item -ItemType Directory -Force -Path $sysGlobalStorage | Out-Null
+    }
+    if (!(Test-Path $profGlobalStorage)) {
+        New-Item -ItemType Directory -Force -Path $profGlobalStorage | Out-Null
+    }
+    $authExclusions = @("state.vscdb", "state.vscdb.backup", "storage.json", "secrets.json")
+    $items = Get-ChildItem -Path $sysGlobalStorage -ErrorAction SilentlyContinue
+    foreach ($item in $items) {
+        if ($authExclusions -contains $item.Name) { continue }
+        $destItem = "$profGlobalStorage\$($item.Name)"
+        if ($item.PSIsContainer) {
+            if (!(New-SharedDirJunction -src $item.FullName -dest $destItem)) {
+                Write-Warning "Failed to create junction for '$($item.Name)' in shared profile '$name'."
+            }
+        } else {
+            if (!(New-SharedFileLink -src $item.FullName -dest $destItem)) {
+                Write-Warning "Failed to link '$($item.Name)' for shared profile '$name'. Shared profiles require Administrator privileges or Developer Mode on Windows."
+            }
+        }
+    }
+}
+
+function Invoke-CreateSharedProfile {
+    param($name)
+    $profileDir = "$BASE\$name"
+
+    New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+    New-Item -ItemType File      -Force -Path "$profileDir\.shared" | Out-Null
+
+    Sync-SharedProfile $name
 }
 
 function Invoke-LaunchProfile {
@@ -597,6 +719,10 @@ function Invoke-LaunchProfile {
 
     Write-Host "Launching Antigravity Desktop App for profile '$PROFILE'"
     
+    if (Test-SharedProfile $PROFILE) {
+        Sync-SharedProfile $PROFILE
+    }
+
     $hadSavedCred = Prepare-LaunchCredential $PROFILE
 
     $oldUserProfile  = $env:USERPROFILE
@@ -622,86 +748,6 @@ function Invoke-LaunchProfile {
         }
 
         Start-Process -FilePath $APP -ArgumentList $launchArgs -Wait
-    } finally {
-        $env:USERPROFILE  = $oldUserProfile
-        $env:APPDATA      = $oldAppData
-        $env:LOCALAPPDATA = $oldLocalAppData
-
-        Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred
-    }
-}
-
-function Invoke-LaunchIDEProfile {
-    param($PROFILE, $ArgsToForward)
-
-    if (Process-ProfileCredentialFlags $PROFILE $ArgsToForward) {
-        return
-    }
-
-    if ([string]::IsNullOrEmpty($IDE_APP) -or !(Test-Path $IDE_APP)) {
-        Write-Error "Error: Antigravity IDE not found"
-        exit 1
-    }
-
-    $gProf = Get-GlobalProfile
-    $isGlobal = ($gProf -and $gProf -eq $PROFILE)
-
-    if ($isGlobal) {
-        Write-Host "Launching Antigravity IDE for global profile '$PROFILE'"
-        Restore-GlobalCredential
-        try {
-            $launchArgs = if ($ArgsToForward) {
-                $ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" }
-            } else { @() }
-
-            if ($IDE_APP.EndsWith(".cmd") -or $IDE_APP.EndsWith(".bat")) {
-                if ($launchArgs) { & $IDE_APP @launchArgs } else { & $IDE_APP }
-            } else {
-                if ($launchArgs) { Start-Process -FilePath $IDE_APP -ArgumentList $launchArgs -Wait } else { Start-Process -FilePath $IDE_APP -Wait }
-            }
-        } finally {
-            Save-GlobalCredential $PROFILE | Out-Null
-        }
-        return
-    }
-
-    $PROFILE_DIR = "$BASE\$PROFILE"
-    if (!(Test-Path $PROFILE_DIR)) {
-        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
-        exit 1
-    }
-
-    Write-Host "Launching Antigravity IDE for profile '$PROFILE'"
-    
-    $hadSavedCred = Prepare-LaunchCredential $PROFILE
-
-    $oldUserProfile  = $env:USERPROFILE
-    $oldAppData      = $env:APPDATA
-    $oldLocalAppData = $env:LOCALAPPDATA
-
-    try {
-        $env:USERPROFILE  = $PROFILE_DIR
-        $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
-        $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
-        
-        $userDataDir = "$PROFILE_DIR\AppData\Roaming\Antigravity"
-        $extDir = "$PROFILE_DIR\.antigravity\extensions"
-
-        $launchArgs = @(
-            "--user-data-dir", $userDataDir,
-            "--extensions-dir", $extDir,
-            "--password-store=basic"
-        )
-
-        if ($ArgsToForward) {
-            $launchArgs += ($ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" })
-        }
-
-        if ($IDE_APP.EndsWith(".cmd") -or $IDE_APP.EndsWith(".bat")) {
-            & $IDE_APP @launchArgs
-        } else {
-            Start-Process -FilePath $IDE_APP -ArgumentList $launchArgs -Wait
-        }
     } finally {
         $env:USERPROFILE  = $oldUserProfile
         $env:APPDATA      = $oldAppData
@@ -753,6 +799,10 @@ function Invoke-LaunchCLIProfile {
 
     Write-Host "Launching Antigravity CLI for profile '$PROFILE'"
     
+    if (Test-SharedProfile $PROFILE) {
+        Sync-SharedProfile $PROFILE
+    }
+
     $hadSavedCred = Prepare-LaunchCredential $PROFILE
 
     $oldUserProfile  = $env:USERPROFILE
@@ -857,11 +907,6 @@ function Invoke-NewProfile {
     }
 
     Validate-Name $name
-
-    if ($isGlobal) {
-        Set-GlobalProfile $name
-        return
-    }
 
     $profileDir = "$BASE\$name"
     if (Test-Path $profileDir) {
@@ -983,6 +1028,10 @@ function Invoke-CloneProfile {
 
     Write-Host "Cloning profile '$SRC' to '$DEST'..."
     Copy-Item -Path $SRC_DIR -Destination $DEST_DIR -Recurse
+    if (Test-SharedProfile $SRC) {
+        New-Item -ItemType File -Force -Path "$DEST_DIR\.shared" | Out-Null
+        Sync-SharedProfile $DEST
+    }
     Invoke-CreateShortcut $DEST
 
     Write-Host "Successfully cloned '$SRC' to '$DEST'"
@@ -1086,15 +1135,7 @@ function Invoke-DoctorCli {
         $warnings++
     }
 
-    # 1b. Antigravity IDE Installation
-    if ($IDE_APP -and (Test-Path $IDE_APP)) {
-        Write-Host "  [OK] Antigravity IDE: Found at $IDE_APP"
-    } else {
-        Write-Host "  [WARN] Antigravity IDE: Not found. Set MULTIGRAVITY_IDE_APP or ensure antigravity-ide is in PATH."
-        $warnings++
-    }
-
-    # 1c. Antigravity CLI Installation
+    # 1b. Antigravity CLI Installation
     if ($CLI_APP -and (Test-Path $CLI_APP)) {
         Write-Host "  [OK] Antigravity CLI: Found at $CLI_APP"
     } else {
@@ -1135,6 +1176,17 @@ function Invoke-DoctorCli {
         Write-Host "  [OK] Global Profile: $gProf ($credState)"
     } else {
         Write-Host "  [INFO] Global Profile: None set (run 'multigravity global <name>' or 'multigravity new <name> --global')"
+    }
+
+    # 5. Shared Profiles Health Check
+    if (Test-Path $BASE) {
+        $sharedProfiles = Get-ChildItem -Directory -Path $BASE -ErrorAction SilentlyContinue | Where-Object { Test-Path "$($_.FullName)\.shared" }
+        if ($sharedProfiles) {
+            foreach ($sp in $sharedProfiles) {
+                Sync-SharedProfile $sp.Name
+                Write-Host "  [OK] Shared Profile '$($sp.Name)': Extensions & settings synced"
+            }
+        }
     }
 
     Write-Host ""
@@ -1423,12 +1475,6 @@ switch ($cmd) {
             Invoke-HelpCompletion
         }
     }
-    "ide" {
-        $AllArgs = @()
-        if ($arg2)       { $AllArgs += $arg2 }
-        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
-        Invoke-LaunchIDEProfile $arg1 $AllArgs
-    }
     "app" {
         $AllArgs = @()
         if ($arg2)       { $AllArgs += $arg2 }
@@ -1466,10 +1512,7 @@ switch ($cmd) {
         if ($arg2)       { $AllArgs += $arg2 }
         if ($ForwardArgs) { $AllArgs += $ForwardArgs }
 
-        if ($AllArgs -contains "--ide") {
-            $filteredArgs = $AllArgs | Where-Object { $_ -ne "--ide" }
-            Invoke-LaunchIDEProfile $cmd $filteredArgs
-        } elseif ($AllArgs -contains "--cli" -or $AllArgs -contains "--agy") {
+        if ($AllArgs -contains "--cli" -or $AllArgs -contains "--agy") {
             $filteredArgs = $AllArgs | Where-Object { $_ -ne "--cli" -and $_ -ne "--agy" }
             Invoke-LaunchCLIProfile $cmd $filteredArgs
         } else {

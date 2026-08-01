@@ -2,7 +2,7 @@
 
 # Multigravity Win CLI (Redux)
 
-**Run multiple Antigravity IDE profiles simultaneously — each with its own accounts, extensions, and settings. For real this time.**
+**Run multiple Antigravity profiles simultaneously — each with its own accounts, extensions, and settings. For real this time.**
 
 No more logging in and out. Launch as many profiles as you need, all at once.
 
@@ -33,18 +33,11 @@ multigravity new personal
 # Launch a profile (Antigravity Desktop UI)
 multigravity work
 
-# Launch Antigravity IDE for a profile
-multigravity ide work
-multigravity work --ide
-
 # Launch Antigravity CLI (agy) for a profile
 multigravity cli work
 multigravity work --cli
 
-# Pass arguments straight through to Antigravity IDE, Desktop App, or CLI
-multigravity ide work .
-multigravity ide work path/to/project
-multigravity ide work --new-window
+# Pass arguments straight through to Desktop App or CLI
 multigravity cli work --help
 ```
 
@@ -75,7 +68,6 @@ Each profile gets an automatic clickable launcher:
 | `multigravity <name> --global [--save_credential\|--remove_credentials]` | Mark profile as global and optionally save or remove its credential |
 | `multigravity <name>` | Launch a profile in Antigravity Desktop App |
 | `multigravity app <name>` | Launch a profile in Antigravity Desktop App |
-| `multigravity ide <name> [args]` | Launch a profile in Antigravity IDE |
 | `multigravity cli <name> [args]` | Launch Antigravity CLI (`agy`) with isolated profile state |
 | `multigravity agy <name> [args]` | Alias for `multigravity cli` |
 | `multigravity list` | List all profiles |
