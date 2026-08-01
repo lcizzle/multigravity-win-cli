@@ -217,8 +217,6 @@ function Set-GlobalProfile {
     Set-Content -Path "$BASE\.global_profile" -Value $PROFILE -Encoding UTF8
     Write-Host "Set global profile name to '$PROFILE'"
 
-    Invoke-CreateShortcut $PROFILE
-
     if (Test-Path $BASE) {
         $sharedProfiles = Get-ChildItem -Directory -Path $BASE -ErrorAction SilentlyContinue | Where-Object { Test-Path "$($_.FullName)\.shared" }
         foreach ($sp in $sharedProfiles) {
@@ -450,10 +448,11 @@ function Write-Usage {
     Write-Host "Usage: multigravity <command> [args]"
     Write-Host ""
     Write-Host "Commands:"
-    Write-Host "  new <name> [options]        Create a new profile + Start Menu shortcut"
+    Write-Host "  new <name> [options]        Create a new profile"
     Write-Host "      --global                Set this profile as the global default profile"
     Write-Host "      --shared                Share extensions & settings; isolate only accounts"
     Write-Host "      --from <template>        Seed from a saved template"
+    Write-Host "      --shortcut              Create Start Menu shortcut for this profile"
     Write-Host "  global [name|save_credential|remove_credentials|unset]   Manage global profile and credentials"
     Write-Host "  <profile> --save_credential   Save current credential to profile"
     Write-Host "  <profile> --remove_credentials Remove saved credentials for a profile"
@@ -471,7 +470,7 @@ function Write-Usage {
     Write-Host "  update                      Update multigravity to the latest version"
     Write-Host "  doctor                      Run a system diagnosis"
     Write-Host "  stats                       Show storage usage per profile"
-    Write-Host "  shortcuts [restore]         Restore Start Menu shortcuts if they don't exist"
+    Write-Host "  shortcuts [profile|restore]  Create or restore Start Menu shortcuts"
     Write-Host "  completion                  Show setup instructions for shell completion"
     Write-Host "  cli <name> [args]           Launch Antigravity CLI (agy) with the given profile"
     Write-Host "  agy <name> [args]           Alias for cli"
@@ -888,15 +887,18 @@ function Invoke-CreateShortcut {
 function Invoke-NewProfile {
     param($name, [string[]]$extraArgs)
 
-    $shared      = $false
-    $fromTpl     = ""
-    $isGlobal    = $false
+    $shared        = $false
+    $fromTpl       = ""
+    $isGlobal      = $false
+    $createShortcut = $false
     $i = 0
     while ($i -lt $extraArgs.Count) {
         switch ($extraArgs[$i]) {
-            "--shared" { $shared = $true }
-            "--from"   { $i++; if ($i -lt $extraArgs.Count) { $fromTpl = $extraArgs[$i] } }
-            "--global" { $isGlobal = $true }
+            "--shared"   { $shared = $true }
+            "--from"     { $i++; if ($i -lt $extraArgs.Count) { $fromTpl = $extraArgs[$i] } }
+            "--global"   { $isGlobal = $true }
+            "--shortcut" { $createShortcut = $true }
+            "--shortcuts"{ $createShortcut = $true }
         }
         $i++
     }
@@ -936,7 +938,9 @@ function Invoke-NewProfile {
         Set-GlobalProfile $name
     }
 
-    Invoke-CreateShortcut $name
+    if ($createShortcut) {
+        Invoke-CreateShortcut $name
+    }
 }
 
 function Invoke-DeleteProfile {
@@ -1010,7 +1014,7 @@ function Invoke-RenameProfile {
 }
 
 function Invoke-CloneProfile {
-    param($SRC, $DEST)
+    param($SRC, $DEST, [string[]]$extraArgs)
     Validate-Name $SRC
     Validate-Name $DEST
 
@@ -1032,7 +1036,10 @@ function Invoke-CloneProfile {
         New-Item -ItemType File -Force -Path "$DEST_DIR\.shared" | Out-Null
         Sync-SharedProfile $DEST
     }
-    Invoke-CreateShortcut $DEST
+
+    if ($extraArgs -contains "--shortcut" -or $extraArgs -contains "--shortcuts") {
+        Invoke-CreateShortcut $DEST
+    }
 
     Write-Host "Successfully cloned '$SRC' to '$DEST'"
 }
@@ -1118,7 +1125,16 @@ function Invoke-ShortcutsCmd {
         $force = $true
     }
 
-    Invoke-RestoreShortcuts -Force:$force
+    if ([string]::IsNullOrWhiteSpace($subCmd) -or $subCmd -eq "restore" -or $subCmd -eq "--force" -or $subCmd -eq "-f") {
+        Invoke-RestoreShortcuts -Force:$force
+    } else {
+        $targetProfile = $subCmd
+        if ($subCmd -eq "create" -and $extraArgs.Count -gt 0) {
+            $targetProfile = $extraArgs[0]
+        }
+        Validate-Name $targetProfile
+        Invoke-CreateShortcut $targetProfile
+    }
 }
 
 function Invoke-DoctorCli {
@@ -1243,7 +1259,7 @@ function Invoke-GenerateCompletion {
         @"
 Register-ArgumentCompleter -Native -CommandName multigravity -ScriptBlock {
     param(`$wordToComplete, `$commandAst, `$cursorPosition)
-    `$opts = @('new', 'list', 'status', 'rename', 'delete', 'clone', 'template', 'export', 'import', 'update', 'doctor', 'stats', 'shortcuts', 'completion', 'help')
+    `$opts = @('new', 'list', 'status', 'rename', 'delete', 'clone', 'template', 'export', 'import', 'update', 'doctor', 'stats', 'shortcuts', 'completion', 'help', '--shortcut')
     `$profiles = if (Test-Path '$BASE') { Get-ChildItem -Directory -Path '$BASE' | Select-Object -ExpandProperty Name } else { @() }
     (`$opts + `$profiles) | Where-Object { `$_ -like "`$wordToComplete*" } | ForEach-Object {
         [System.Management.Automation.CompletionResult]::new(`$_, `$_, 'ParameterValue', `$_)
@@ -1353,7 +1369,7 @@ function Invoke-ExportProfile {
 }
 
 function Invoke-ImportProfile {
-    param($archivePath, $name)
+    param($archivePath, $name, [string[]]$extraArgs)
 
     if ([string]::IsNullOrWhiteSpace($archivePath)) {
         Write-Error "Error: usage: multigravity import <archive.zip> [name]"; exit 1
@@ -1392,7 +1408,9 @@ function Invoke-ImportProfile {
         }
     }
 
-    Invoke-CreateShortcut $name
+    if ($extraArgs -contains "--shortcut" -or $extraArgs -contains "--shortcuts") {
+        Invoke-CreateShortcut $name
+    }
     Write-Host "Imported profile '$name'"
 }
 
@@ -1436,7 +1454,9 @@ switch ($cmd) {
         Invoke-DeleteProfile $arg1
     }
     "clone" {
-        Invoke-CloneProfile $arg1 $arg2
+        $extra = @()
+        if ($ForwardArgs) { $extra += $ForwardArgs }
+        Invoke-CloneProfile $arg1 $arg2 $extra
     }
     "template" {
         Invoke-TemplateCmd $arg1 $arg2 ($ForwardArgs | Select-Object -First 1)
@@ -1445,7 +1465,9 @@ switch ($cmd) {
         Invoke-ExportProfile $arg1 $arg2
     }
     "import" {
-        Invoke-ImportProfile $arg1 $arg2
+        $extra = @()
+        if ($ForwardArgs) { $extra += $ForwardArgs }
+        Invoke-ImportProfile $arg1 $arg2 $extra
     }
     "update" {
         Invoke-UpdateCli

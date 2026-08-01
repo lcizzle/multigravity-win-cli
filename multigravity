@@ -658,12 +658,13 @@ list_profiles() {
 }
 
 new_profile() {
-  local profile="" shared=false from_tpl=""
+  local profile="" shared=false from_tpl="" shortcut=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --shared)       shared=true ;;
       --from)         from_tpl="${2-}"; shift ;;
+      --shortcut|--shortcuts) shortcut=true ;;
       -*)             abort "unknown option: $1" ;;
       *)              profile="$1" ;;
     esac
@@ -693,7 +694,9 @@ new_profile() {
   fi
 
   print_info "Created profile '$profile'"
-  create_shortcut "$profile"
+  if [ "$shortcut" = true ]; then
+    create_shortcut "$profile"
+  fi
 }
 
 delete_profile() {
@@ -745,14 +748,27 @@ rename_profile() {
 }
 
 clone_profile() {
-  local src=$1
-  local dest=$2
-  local src_path
-  local dest_path
+  local src="" dest="" shortcut=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --shortcut|--shortcuts) shortcut=true ;;
+      -*) abort "unknown option: $1" ;;
+      *)
+        if [ -z "$src" ]; then
+          src="$1"
+        elif [ -z "$dest" ]; then
+          dest="$1"
+        fi
+        ;;
+    esac
+    shift
+  done
 
   validate_name "$src"
   validate_name "$dest"
 
+  local src_path
+  local dest_path
   src_path="$(profile_dir "$src")"
   dest_path="$(profile_dir "$dest")"
 
@@ -769,7 +785,9 @@ clone_profile() {
     touch "$dest_path/.shared"
     sync_shared_profile "$dest"
   fi
-  create_shortcut "$dest"
+  if [ "$shortcut" = true ]; then
+    create_shortcut "$dest"
+  fi
 
   print_info "Successfully cloned '$src' to '$dest'"
 }
@@ -886,12 +904,21 @@ profile_stats() {
 
 restore_shortcuts() {
   local force=false
+  local target_prof=""
   local arg
   for arg in "$@"; do
     if [ "$arg" = "--force" ] || [ "$arg" = "-f" ]; then
       force=true
+    elif [ "$arg" != "restore" ] && [[ "$arg" != -* ]] && [ -z "$target_prof" ]; then
+      target_prof="$arg"
     fi
   done
+
+  if [ -n "$target_prof" ]; then
+    validate_name "$target_prof"
+    create_shortcut "$target_prof"
+    return 0
+  fi
 
   if [ ! -d "$BASE" ]; then
     print_info "No profiles found."
@@ -1062,14 +1089,27 @@ export_profile() {
 }
 
 import_profile() {
-  local archive="${1-}" profile="${2-}"
+  local archive="" profile="" shortcut=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --shortcut|--shortcuts) shortcut=true ;;
+      -*) abort "unknown option: $1" ;;
+      *)
+        if [ -z "$archive" ]; then
+          archive="$1"
+        elif [ -z "$profile" ]; then
+          profile="$1"
+        fi
+        ;;
+    esac
+    shift
+  done
 
-  [ -n "$archive" ] || abort "usage: multigravity import <archive.tar.gz> [name]"
-  [ -f "$archive" ]  || abort "file not found: $archive"
+  [ -z "$archive" ] && abort "usage: multigravity import <archive.tar.gz> [name]"
+  [ -f "$archive" ] || abort "archive file '$archive' not found"
 
   if [ -z "$profile" ]; then
-    profile="$(tar -tzf "$archive" 2>/dev/null | head -1 | cut -d'/' -f1)"
-    [ -n "$profile" ] || abort "cannot infer profile name from archive — pass a name explicitly"
+    profile="$(basename "$archive" | sed -E 's/\.(tar\.gz|tgz|zip)$//')"
   fi
 
   validate_name "$profile"
@@ -1088,7 +1128,9 @@ import_profile() {
     mv "$BASE/$top_dir" "$dest"
   fi
 
-  create_shortcut "$profile"
+  if [ "$shortcut" = true ]; then
+    create_shortcut "$profile"
+  fi
   print_info "Imported profile '$profile'"
 }
 
@@ -1219,9 +1261,10 @@ usage() {
 Usage: multigravity <command> [args]
 
 Commands:
-  new <name> [options]        Create a new profile + desktop shortcut
+  new <name> [options]        Create a new profile
       --shared                Share extensions & settings; isolate only accounts
       --from <template>       Seed from a saved template
+      --shortcut              Create desktop / launcher shortcut
   list                        List existing profiles
   status                      Show running state, type, and last-used per profile
   rename <old> <new>          Rename a profile (updates its shortcut)
@@ -1235,7 +1278,7 @@ Commands:
   update                      Update multigravity to the latest version
   doctor                      Run a system diagnosis
   stats                       Show storage usage per profile
-  shortcuts [restore]         Restore shortcuts for all profiles
+  shortcuts [profile|restore] Restore or create shortcuts for profiles
   completion                  Show setup instructions for shell completion
   cli <name> [args...]        Launch Antigravity CLI (agy) with the given profile
   agy <name> [args...]        Alias for cli
@@ -1269,7 +1312,8 @@ case "$cmd" in
     delete_profile "${2-}"
     ;;
   clone)
-    clone_profile "${2-}" "${3-}"
+    shift
+    clone_profile "$@"
     ;;
   template)
     shift
@@ -1279,7 +1323,8 @@ case "$cmd" in
     export_profile "${2-}" "${3-}"
     ;;
   import)
-    import_profile "${2-}" "${3-}"
+    shift
+    import_profile "$@"
     ;;
   update)
     update_cli

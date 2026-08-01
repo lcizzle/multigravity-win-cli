@@ -41,11 +41,11 @@ multigravity work --cli
 multigravity cli work --help
 ```
 
-Each profile gets an automatic clickable launcher:
+Create a Start Menu shortcut on demand with `--shortcut`:
 
-| Platform | Location |
-|----------|----------|
-| Windows  | Start Menu → Programs |
+```powershell
+multigravity new work --shortcut
+```
 
 ---
 
@@ -56,6 +56,7 @@ Each profile gets an automatic clickable launcher:
 | Command | Description |
 |---------|-------------|
 | `multigravity new <name>` | Create a new full profile |
+| `multigravity new <name> --shortcut` | Create a profile and a Start Menu launcher shortcut |
 | `multigravity new <name> --global` | Create a profile and designate it as the default global profile |
 | `multigravity new <name> --shared` | Create a lightweight profile (shared extensions & settings, isolated accounts) |
 | `multigravity new <name> --from <template>` | Create a profile from a saved template |
@@ -97,7 +98,7 @@ Each profile gets an automatic clickable launcher:
 |---------|-------------|
 | `multigravity stats` | Show disk usage per profile |
 | `multigravity doctor` | Diagnose your environment |
-| `multigravity shortcuts` | Restore Start Menu / Desktop shortcuts for profiles |
+| `multigravity shortcuts [name\|restore]` | Create or restore Start Menu shortcuts |
 | `multigravity update` | Update Multigravity to the latest version |
 | `multigravity completion` | Set up shell tab-completion |
 | `multigravity help` | Show help |
