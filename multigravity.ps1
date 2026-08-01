@@ -209,39 +209,174 @@ public class MultigravityCredVault {
 
 $TARGET_CRED_NAME = "gemini:antigravity"
 
-function Save-CurrentCredentialToActiveProfile {
-    $activeFile = "$BASE\.active_profile"
-    if (Test-Path $activeFile) {
-        $lastProfile = (Get-Content $activeFile -Raw).Trim()
-        $lastDir = "$BASE\$lastProfile"
-        if (Test-Path $lastDir) {
-            $user = $null
-            $blob = [MultigravityCredVault]::ExportCredential($TARGET_CRED_NAME, [ref]$user)
-            $credPath = "$lastDir\.credentials.json"
-            if ($blob) {
-                $data = @{
-                    userName = $user
-                    blob     = $blob
-                    updated  = (Get-Date).ToString("o")
-                } | ConvertTo-Json
-                Set-Content -Path $credPath -Value $data -Encoding UTF8
-            }
+function Get-GlobalProfile {
+    $globalFile = "$BASE\.global_profile"
+    if (Test-Path $globalFile) {
+        $g = (Get-Content $globalFile -Raw).Trim()
+        if (![string]::IsNullOrWhiteSpace($g)) {
+            return $g
         }
+    }
+    return $null
+}
+
+function Set-GlobalProfile {
+    param($PROFILE)
+    if ([string]::IsNullOrWhiteSpace($PROFILE)) {
+        Write-Error "Error: profile name required"
+        exit 1
+    }
+    if ($PROFILE -notmatch "^[a-zA-Z0-9][a-zA-Z0-9-]*$") {
+        Write-Error "Error: profile name must start with alphanumeric and contain only letters, numbers, or hyphens"
+        exit 1
+    }
+    if (!(Test-Path $BASE)) {
+        New-Item -ItemType Directory -Force -Path $BASE | Out-Null
+    }
+    Set-Content -Path "$BASE\.global_profile" -Value $PROFILE -Encoding UTF8
+    Write-Host "Set global profile name to '$PROFILE'"
+
+    Invoke-CreateShortcut $PROFILE
+}
+
+function Unset-GlobalProfile {
+    $globalFile = "$BASE\.global_profile"
+    if (Test-Path $globalFile) {
+        Remove-Item $globalFile -Force -ErrorAction SilentlyContinue
+    }
+    $globalCred = "$BASE\.global_credentials.json"
+    if (Test-Path $globalCred) {
+        Remove-Item $globalCred -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "Unset global profile configuration and removed global credentials."
+}
+
+function Save-GlobalCredential {
+    param($PROFILE)
+    if ($PROFILE) {
+        Set-GlobalProfile $PROFILE
+    }
+    if (!(Test-Path $BASE)) {
+        New-Item -ItemType Directory -Force -Path $BASE | Out-Null
+    }
+    $user = $null
+    $blob = [MultigravityCredVault]::ExportCredential($TARGET_CRED_NAME, [ref]$user)
+    if ($blob) {
+        $credPath = "$BASE\.global_credentials.json"
+        $data = @{
+            userName = $user
+            blob     = $blob
+            updated  = (Get-Date).ToString("o")
+        } | ConvertTo-Json
+        Set-Content -Path $credPath -Value $data -Encoding UTF8
+        $gName = Get-GlobalProfile
+        $nameInfo = if ($gName) { " for global profile '$gName'" } else { "" }
+        Write-Host "Saved global credential$nameInfo."
+        return $true
+    } else {
+        Write-Host "No active credential found in Windows Credential Manager under '$TARGET_CRED_NAME'."
+        return $false
     }
 }
 
-function Switch-CredentialToProfile {
+function Remove-GlobalCredential {
+    $credPath = "$BASE\.global_credentials.json"
+    if (Test-Path $credPath) {
+        Remove-Item $credPath -Force
+        Write-Host "Removed saved global credential file."
+    } else {
+        Write-Host "No saved global credential file found."
+    }
+}
+
+function Save-CredentialToProfile {
+    param($PROFILE)
+    $g = Get-GlobalProfile
+    if ($g -and $g -eq $PROFILE) {
+        Save-GlobalCredential $PROFILE | Out-Null
+        return $true
+    }
+    $profileDir = "$BASE\$PROFILE"
+    if (!(Test-Path $profileDir)) {
+        Write-Error "Error: profile '$PROFILE' does not exist"
+        exit 1
+    }
+    $user = $null
+    $blob = [MultigravityCredVault]::ExportCredential($TARGET_CRED_NAME, [ref]$user)
+    if ($blob) {
+        $credPath = "$profileDir\.credentials.json"
+        $data = @{
+            userName = $user
+            blob     = $blob
+            updated  = (Get-Date).ToString("o")
+        } | ConvertTo-Json
+        Set-Content -Path $credPath -Value $data -Encoding UTF8
+        Write-Host "Saved credential to profile '$PROFILE'"
+        return $true
+    } else {
+        Write-Host "No active credential found in Windows Credential Manager under '$TARGET_CRED_NAME'."
+        return $false
+    }
+}
+
+function Remove-ProfileCredential {
+    param($PROFILE)
+    $g = Get-GlobalProfile
+    if ($g -and $g -eq $PROFILE) {
+        Remove-GlobalCredential
+        return
+    }
+    $profileDir = "$BASE\$PROFILE"
+    if (!(Test-Path $profileDir)) {
+        Write-Error "Error: profile '$PROFILE' does not exist"
+        exit 1
+    }
+    $credPath = "$profileDir\.credentials.json"
+    if (Test-Path $credPath) {
+        Remove-Item $credPath -Force
+        Write-Host "Removed saved credentials for profile '$PROFILE'"
+    } else {
+        Write-Host "No saved credentials found for profile '$PROFILE'"
+    }
+}
+
+function Restore-GlobalCredential {
+    $globalCredPath = "$BASE\.global_credentials.json"
+    if (Test-Path $globalCredPath) {
+        try {
+            $json = Get-Content $globalCredPath -Raw | ConvertFrom-Json
+            if ($json.blob) {
+                [MultigravityCredVault]::ImportCredential($TARGET_CRED_NAME, $json.userName, $json.blob) | Out-Null
+                $gName = Get-GlobalProfile
+                $nameInfo = if ($gName) { " ('$gName')" } else { "" }
+                Write-Host "Restored global profile credential vault$nameInfo."
+                if ($gName) {
+                    Set-Content -Path "$BASE\.active_profile" -Value $gName -Encoding UTF8
+                } else {
+                    Remove-Item "$BASE\.active_profile" -Force -ErrorAction SilentlyContinue
+                }
+                return
+            }
+        } catch {}
+    }
+    [MultigravityCredVault]::RemoveCredential($TARGET_CRED_NAME) | Out-Null
+    Write-Host "Cleared credential vault (no global credential to restore)."
+    Remove-Item "$BASE\.active_profile" -Force -ErrorAction SilentlyContinue
+}
+
+function Prepare-LaunchCredential {
     param($PROFILE)
     $profileDir = "$BASE\$PROFILE"
     $credPath   = "$profileDir\.credentials.json"
-
-    # Save previous profile's credential state first
-    Save-CurrentCredentialToActiveProfile
-
-    # Set current profile as active
+    
+    if (!(Test-Path $BASE)) {
+        New-Item -ItemType Directory -Force -Path $BASE | Out-Null
+    }
     Set-Content -Path "$BASE\.active_profile" -Value $PROFILE -Encoding UTF8
 
-    if (Test-Path $credPath) {
+    $hadSavedCred = Test-Path $credPath
+
+    if ($hadSavedCred) {
         try {
             $json = Get-Content $credPath -Raw | ConvertFrom-Json
             if ($json.blob) {
@@ -255,6 +390,34 @@ function Switch-CredentialToProfile {
         [MultigravityCredVault]::RemoveCredential($TARGET_CRED_NAME) | Out-Null
         Write-Host "Profile '$PROFILE' starting with fresh credential state (login required)."
     }
+
+    return $hadSavedCred
+}
+
+function Restore-PostLaunchCredential {
+    param($PROFILE, [bool]$HadSavedCred)
+    $globalProfile = Get-GlobalProfile
+    $isGlobal = ($globalProfile -and $globalProfile -eq $PROFILE)
+
+    if ($isGlobal) {
+        Save-GlobalCredential $PROFILE | Out-Null
+    } else {
+        if (!$HadSavedCred) {
+            $user = $null
+            $blob = [MultigravityCredVault]::ExportCredential($TARGET_CRED_NAME, [ref]$user)
+            if ($blob) {
+                $credPath = "$BASE\$PROFILE\.credentials.json"
+                $data = @{
+                    userName = $user
+                    blob     = $blob
+                    updated  = (Get-Date).ToString("o")
+                } | ConvertTo-Json
+                Set-Content -Path $credPath -Value $data -Encoding UTF8
+                Write-Host "Saved new credential for profile '$PROFILE'"
+            }
+        }
+        Restore-GlobalCredential
+    }
 }
 
 function Test-SharedProfile {
@@ -262,13 +425,51 @@ function Test-SharedProfile {
     return Test-Path "$BASE\$name\.shared"
 }
 
+function Process-ProfileCredentialFlags {
+    param($PROFILE, [string[]]$AllArgs)
+
+    $isGlobalFlag         = $AllArgs -contains "--global"
+    $isSaveFlag           = ($AllArgs -contains "--save_credential" -or $AllArgs -contains "--save-credential" -or $AllArgs -contains "--save_credentials" -or $AllArgs -contains "--save")
+    $isRemoveCredsFlag    = ($AllArgs -contains "--remove_credentials" -or $AllArgs -contains "--remove-credentials" -or $AllArgs -contains "--remove-credential")
+
+    $gProf = Get-GlobalProfile
+    $isGlobal = ($isGlobalFlag -or ($gProf -and $gProf -eq $PROFILE))
+
+    if ($isGlobal) {
+        Set-GlobalProfile $PROFILE
+        if ($isSaveFlag) {
+            Save-GlobalCredential $PROFILE | Out-Null
+            return $true
+        }
+        if ($isRemoveCredsFlag) {
+            Remove-GlobalCredential
+            return $true
+        }
+    } else {
+        if ($isSaveFlag) {
+            Save-CredentialToProfile $PROFILE | Out-Null
+            return $true
+        }
+        if ($isRemoveCredsFlag) {
+            Remove-ProfileCredential $PROFILE
+            return $true
+        }
+    }
+    return $false
+}
+
 function Write-Usage {
     Write-Host "Usage: multigravity <command> [args]"
     Write-Host ""
     Write-Host "Commands:"
     Write-Host "  new <name> [options]        Create a new profile + Start Menu shortcut"
+    Write-Host "      --global                Set this profile as the global default profile"
     Write-Host "      --shared                Share extensions & settings; isolate only accounts"
     Write-Host "      --from <template>        Seed from a saved template"
+    Write-Host "  global [name|save_credential|remove_credentials|unset]   Manage global profile and credentials"
+    Write-Host "  <profile> --save_credential   Save current credential to profile"
+    Write-Host "  <profile> --remove_credentials Remove saved credentials for a profile"
+    Write-Host "  <profile> --global [--save_credential|--remove_credentials]   Set profile as global / manage credential"
     Write-Host "  list                        List existing profiles"
     Write-Host "  status                      Show running state, type, and last-used per profile"
     Write-Host "  rename <old> <new>          Rename a profile (updates shortcut if present)"
@@ -357,11 +558,9 @@ function Invoke-CreateSharedProfile {
 
 function Invoke-LaunchProfile {
     param($PROFILE, $ArgsToForward)
-    $PROFILE_DIR = "$BASE\$PROFILE"
 
-    if (!(Test-Path $PROFILE_DIR)) {
-        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
-        exit 1
+    if (Process-ProfileCredentialFlags $PROFILE $ArgsToForward) {
+        return
     }
 
     if ([string]::IsNullOrEmpty($APP) -or !(Test-Path $APP)) {
@@ -369,12 +568,37 @@ function Invoke-LaunchProfile {
         exit 1
     }
 
+    $gProf = Get-GlobalProfile
+    $isGlobal = ($gProf -and $gProf -eq $PROFILE)
+
+    if ($isGlobal) {
+        Write-Host "Launching Antigravity Desktop App for global profile '$PROFILE'"
+        Restore-GlobalCredential
+        try {
+            $launchArgs = if ($ArgsToForward) {
+                $ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" }
+            } else { @() }
+            if ($launchArgs) {
+                Start-Process -FilePath $APP -ArgumentList $launchArgs -Wait
+            } else {
+                Start-Process -FilePath $APP -Wait
+            }
+        } finally {
+            Save-GlobalCredential $PROFILE | Out-Null
+        }
+        return
+    }
+
+    $PROFILE_DIR = "$BASE\$PROFILE"
+    if (!(Test-Path $PROFILE_DIR)) {
+        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
+        exit 1
+    }
+
     Write-Host "Launching Antigravity Desktop App for profile '$PROFILE'"
     
-    # Swap Windows Credential Manager vault entry for this profile
-    Switch-CredentialToProfile $PROFILE
+    $hadSavedCred = Prepare-LaunchCredential $PROFILE
 
-    # Launch Antigravity Desktop UI with isolated USERPROFILE and explicit flags
     $oldUserProfile  = $env:USERPROFILE
     $oldAppData      = $env:APPDATA
     $oldLocalAppData = $env:LOCALAPPDATA
@@ -394,24 +618,24 @@ function Invoke-LaunchProfile {
         )
 
         if ($ArgsToForward) {
-            $launchArgs += $ArgsToForward
+            $launchArgs += ($ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" })
         }
 
-        Start-Process -FilePath $APP -ArgumentList $launchArgs
+        Start-Process -FilePath $APP -ArgumentList $launchArgs -Wait
     } finally {
         $env:USERPROFILE  = $oldUserProfile
         $env:APPDATA      = $oldAppData
         $env:LOCALAPPDATA = $oldLocalAppData
+
+        Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred
     }
 }
 
 function Invoke-LaunchIDEProfile {
     param($PROFILE, $ArgsToForward)
-    $PROFILE_DIR = "$BASE\$PROFILE"
 
-    if (!(Test-Path $PROFILE_DIR)) {
-        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
-        exit 1
+    if (Process-ProfileCredentialFlags $PROFILE $ArgsToForward) {
+        return
     }
 
     if ([string]::IsNullOrEmpty($IDE_APP) -or !(Test-Path $IDE_APP)) {
@@ -419,12 +643,38 @@ function Invoke-LaunchIDEProfile {
         exit 1
     }
 
+    $gProf = Get-GlobalProfile
+    $isGlobal = ($gProf -and $gProf -eq $PROFILE)
+
+    if ($isGlobal) {
+        Write-Host "Launching Antigravity IDE for global profile '$PROFILE'"
+        Restore-GlobalCredential
+        try {
+            $launchArgs = if ($ArgsToForward) {
+                $ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" }
+            } else { @() }
+
+            if ($IDE_APP.EndsWith(".cmd") -or $IDE_APP.EndsWith(".bat")) {
+                if ($launchArgs) { & $IDE_APP @launchArgs } else { & $IDE_APP }
+            } else {
+                if ($launchArgs) { Start-Process -FilePath $IDE_APP -ArgumentList $launchArgs -Wait } else { Start-Process -FilePath $IDE_APP -Wait }
+            }
+        } finally {
+            Save-GlobalCredential $PROFILE | Out-Null
+        }
+        return
+    }
+
+    $PROFILE_DIR = "$BASE\$PROFILE"
+    if (!(Test-Path $PROFILE_DIR)) {
+        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
+        exit 1
+    }
+
     Write-Host "Launching Antigravity IDE for profile '$PROFILE'"
     
-    # Swap Windows Credential Manager vault entry for this profile
-    Switch-CredentialToProfile $PROFILE
+    $hadSavedCred = Prepare-LaunchCredential $PROFILE
 
-    # Launch Antigravity IDE with isolated USERPROFILE and explicit flags
     $oldUserProfile  = $env:USERPROFILE
     $oldAppData      = $env:APPDATA
     $oldLocalAppData = $env:LOCALAPPDATA
@@ -444,28 +694,28 @@ function Invoke-LaunchIDEProfile {
         )
 
         if ($ArgsToForward) {
-            $launchArgs += $ArgsToForward
+            $launchArgs += ($ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" })
         }
 
         if ($IDE_APP.EndsWith(".cmd") -or $IDE_APP.EndsWith(".bat")) {
             & $IDE_APP @launchArgs
         } else {
-            Start-Process -FilePath $IDE_APP -ArgumentList $launchArgs
+            Start-Process -FilePath $IDE_APP -ArgumentList $launchArgs -Wait
         }
     } finally {
         $env:USERPROFILE  = $oldUserProfile
         $env:APPDATA      = $oldAppData
         $env:LOCALAPPDATA = $oldLocalAppData
+
+        Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred
     }
 }
 
 function Invoke-LaunchCLIProfile {
     param($PROFILE, $ArgsToForward)
-    $PROFILE_DIR = "$BASE\$PROFILE"
 
-    if (!(Test-Path $PROFILE_DIR)) {
-        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
-        exit 1
+    if (Process-ProfileCredentialFlags $PROFILE $ArgsToForward) {
+        return
     }
 
     if ([string]::IsNullOrEmpty($CLI_APP) -or !(Test-Path $CLI_APP)) {
@@ -473,12 +723,38 @@ function Invoke-LaunchCLIProfile {
         exit 1
     }
 
+    $gProf = Get-GlobalProfile
+    $isGlobal = ($gProf -and $gProf -eq $PROFILE)
+
+    if ($isGlobal) {
+        Write-Host "Launching Antigravity CLI for global profile '$PROFILE'"
+        Restore-GlobalCredential
+        try {
+            $cleanForwardArgs = if ($ArgsToForward) {
+                $ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" }
+            } else { $null }
+
+            if ($cleanForwardArgs) {
+                & $CLI_APP @cleanForwardArgs
+            } else {
+                & $CLI_APP
+            }
+        } finally {
+            Save-GlobalCredential $PROFILE | Out-Null
+        }
+        return
+    }
+
+    $PROFILE_DIR = "$BASE\$PROFILE"
+    if (!(Test-Path $PROFILE_DIR)) {
+        Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
+        exit 1
+    }
+
     Write-Host "Launching Antigravity CLI for profile '$PROFILE'"
     
-    # Swap Windows Credential Manager vault entry for this profile
-    Switch-CredentialToProfile $PROFILE
+    $hadSavedCred = Prepare-LaunchCredential $PROFILE
 
-    # Launch agy with isolated USERPROFILE
     $oldUserProfile  = $env:USERPROFILE
     $oldAppData      = $env:APPDATA
     $oldLocalAppData = $env:LOCALAPPDATA
@@ -488,8 +764,12 @@ function Invoke-LaunchCLIProfile {
         $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
         $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
 
-        if ($ArgsToForward) {
-            & $CLI_APP @ArgsToForward
+        $cleanForwardArgs = if ($ArgsToForward) {
+            $ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" }
+        } else { $null }
+
+        if ($cleanForwardArgs) {
+            & $CLI_APP @cleanForwardArgs
         } else {
             & $CLI_APP
         }
@@ -497,20 +777,25 @@ function Invoke-LaunchCLIProfile {
         $env:USERPROFILE  = $oldUserProfile
         $env:APPDATA      = $oldAppData
         $env:LOCALAPPDATA = $oldLocalAppData
+
+        Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred
     }
 }
 
 function Invoke-ListProfiles {
     Write-Host "Existing profiles:"
+    $globalProf = Get-GlobalProfile
     if (Test-Path $BASE) {
         $profiles = Get-ChildItem -Directory -Path $BASE | Where-Object { $_.PSIsContainer -and $_.Name -ne ".templates" }
         if ($profiles.Count -gt 0) {
             foreach ($p in $profiles) {
-                Write-Host $p.Name
+                $gTag = if ($globalProf -and $p.Name -eq $globalProf) { " (global)" } else { "" }
+                Write-Host "$($p.Name)$gTag"
             }
         }
         elseif ($profiles -is [System.IO.DirectoryInfo]) {
-            Write-Host $profiles.Name
+            $gTag = if ($globalProf -and $profiles.Name -eq $globalProf) { " (global)" } else { "" }
+            Write-Host "$($profiles.Name)$gTag"
         }
         else {
             Write-Host "(none)"
@@ -541,6 +826,10 @@ function Invoke-CreateShortcut {
     if ($APP) {
         $Shortcut.IconLocation = "$APP, 0"
     }
+    $shortcutDir = [System.IO.Path]::GetDirectoryName($SHORTCUT_PATH)
+    if (!(Test-Path $shortcutDir)) {
+        New-Item -ItemType Directory -Force -Path $shortcutDir | Out-Null
+    }
     $Shortcut.Save()
 
     Write-Host "Shortcut created: $SHORTCUT_PATH"
@@ -551,11 +840,13 @@ function Invoke-NewProfile {
 
     $shared      = $false
     $fromTpl     = ""
+    $isGlobal    = $false
     $i = 0
     while ($i -lt $extraArgs.Count) {
         switch ($extraArgs[$i]) {
             "--shared" { $shared = $true }
             "--from"   { $i++; if ($i -lt $extraArgs.Count) { $fromTpl = $extraArgs[$i] } }
+            "--global" { $isGlobal = $true }
         }
         $i++
     }
@@ -566,6 +857,11 @@ function Invoke-NewProfile {
     }
 
     Validate-Name $name
+
+    if ($isGlobal) {
+        Set-GlobalProfile $name
+        return
+    }
 
     $profileDir = "$BASE\$name"
     if (Test-Path $profileDir) {
@@ -590,6 +886,11 @@ function Invoke-NewProfile {
     }
 
     Write-Host "Created profile '$name'"
+
+    if ($isGlobal) {
+        Set-GlobalProfile $name
+    }
+
     Invoke-CreateShortcut $name
 }
 
@@ -613,6 +914,12 @@ function Invoke-DeleteProfile {
                 Remove-Item -Force $SHORTCUT_PATH
                 Write-Host "Removed shortcut: $SHORTCUT_PATH"
             }
+
+            $g = Get-GlobalProfile
+            if ($g -and $g -eq $PROFILE) {
+                Unset-GlobalProfile
+            }
+
             Write-Host "Deleted profile '$PROFILE'"
         } catch {
             Write-Error "Error: could not delete profile directory. Ensure Antigravity is closed and no files are in use."
@@ -642,6 +949,11 @@ function Invoke-RenameProfile {
     }
 
     Rename-Item -Path $OLD_DIR -NewName $NEW
+
+    $g = Get-GlobalProfile
+    if ($g -and $g -eq $OLD) {
+        Set-Content -Path "$BASE\.global_profile" -Value $NEW -Encoding UTF8
+    }
 
     $OLD_SHORTCUT = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Multigravity $OLD.lnk"
     if (Test-Path $OLD_SHORTCUT) {
@@ -717,7 +1029,17 @@ function Invoke-RestoreShortcuts {
     }
 
     $profiles = Get-ChildItem -Directory -Path $BASE -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike ".*" }
-    if (!$profiles -or $profiles.Count -eq 0) {
+    $globalProf = Get-GlobalProfile
+
+    $profileNames = @()
+    if ($profiles) {
+        $profileNames += ($profiles | Select-Object -ExpandProperty Name)
+    }
+    if ($globalProf -and ($profileNames -notcontains $globalProf)) {
+        $profileNames += $globalProf
+    }
+
+    if (!$profileNames -or $profileNames.Count -eq 0) {
         Write-Host "No profiles found."
         return
     }
@@ -725,8 +1047,7 @@ function Invoke-RestoreShortcuts {
     $createdCount = 0
     $skippedCount = 0
 
-    foreach ($p in $profiles) {
-        $name = $p.Name
+    foreach ($name in $profileNames) {
         $shortcutPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Multigravity $name.lnk"
         if ($Force -or !(Test-Path $shortcutPath)) {
             Invoke-CreateShortcut $name
@@ -804,6 +1125,16 @@ function Invoke-DoctorCli {
         }
     } else {
         Write-Host "  [WARN] Profile storage: $BASE (Not yet created)"
+    }
+
+    # 4. Global Profile Check
+    $gProf = Get-GlobalProfile
+    if ($gProf) {
+        $hasGlobalCred = Test-Path "$BASE\$gProf\.credentials.json"
+        $credState = if ($hasGlobalCred) { "credential saved" } else { "no saved credential" }
+        Write-Host "  [OK] Global Profile: $gProf ($credState)"
+    } else {
+        Write-Host "  [INFO] Global Profile: None set (run 'multigravity global <name>' or 'multigravity new <name> --global')"
     }
 
     Write-Host ""
@@ -937,7 +1268,10 @@ function Invoke-StatusProfiles {
             }
         }
 
-        $ptype    = if (Test-Path "$($d.FullName)\.shared") { "shared" } else { "full" }
+        $gProf = Get-GlobalProfile
+        $ptype = if ($gProf -and $d.Name -eq $gProf) {
+            if (Test-Path "$($d.FullName)\.shared") { "global (shared)" } else { "global" }
+        } elseif (Test-Path "$($d.FullName)\.shared") { "shared" } else { "full" }
         $lastUsed = $d.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
         $size     = Get-FolderSize $d.FullName
 
@@ -1016,6 +1350,26 @@ switch ($cmd) {
         if ($arg2)       { $extra += $arg2 }
         if ($ForwardArgs) { $extra += $ForwardArgs }
         Invoke-NewProfile $arg1 $extra
+    }
+    "global" {
+        $sub = $arg1
+        if ($sub -eq "save_credential" -or $sub -eq "save-credential" -or $sub -eq "save" -or $sub -eq "--save_credential" -or $sub -eq "--save-credential" -or $sub -eq "--save") {
+            $prof = if ($arg2) { $arg2 } else { Get-GlobalProfile }
+            Save-GlobalCredential $prof | Out-Null
+        } elseif ($sub -eq "remove_credentials" -or $sub -eq "remove-credentials" -or $sub -eq "--remove_credentials" -or $sub -eq "--remove-credentials" -or $sub -eq "remove" -or $sub -eq "--remove") {
+            Remove-GlobalCredential
+        } elseif ($sub -eq "unset" -or $sub -eq "clear" -or $sub -eq "--unset") {
+            Unset-GlobalProfile
+        } elseif ([string]::IsNullOrWhiteSpace($sub)) {
+            $g = Get-GlobalProfile
+            if ($g) {
+                Write-Host "Current global profile: $g"
+            } else {
+                Write-Host "No global profile currently set. Set one with: multigravity global <profile-name>"
+            }
+        } else {
+            Set-GlobalProfile $sub
+        }
     }
     "list" {
         Invoke-ListProfiles

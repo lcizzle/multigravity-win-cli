@@ -63,8 +63,16 @@ Each profile gets an automatic clickable launcher:
 | Command | Description |
 |---------|-------------|
 | `multigravity new <name>` | Create a new full profile |
+| `multigravity new <name> --global` | Create a profile and designate it as the default global profile |
 | `multigravity new <name> --shared` | Create a lightweight profile (shared extensions & settings, isolated accounts) |
 | `multigravity new <name> --from <template>` | Create a profile from a saved template |
+| `multigravity global [name]` | View or set the active global profile |
+| `multigravity global save_credential` | Save current Windows Credential Manager account to the global profile |
+| `multigravity global remove_credentials` | Remove saved credentials from the global profile |
+| `multigravity global unset` | Unset the current global profile |
+| `multigravity <name> --save_credential` | Save current Windows Credential Manager account to a profile |
+| `multigravity <name> --remove_credentials` | Remove saved credential vault file for a profile |
+| `multigravity <name> --global [--save_credential\|--remove_credentials]` | Mark profile as global and optionally save or remove its credential |
 | `multigravity <name>` | Launch a profile in Antigravity Desktop App |
 | `multigravity app <name>` | Launch a profile in Antigravity Desktop App |
 | `multigravity ide <name> [args]` | Launch a profile in Antigravity IDE |
