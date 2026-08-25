@@ -1,6 +1,24 @@
 $ErrorActionPreference = "Stop"
 
-$INSTALL_DIR = "$env:USERPROFILE\.local\bin"
+function Get-CanonicalUserProfile {
+    if ($env:MULTIGRAVITY_ROOT_USERPROFILE -and (Test-Path $env:MULTIGRAVITY_ROOT_USERPROFILE)) {
+        return $env:MULTIGRAVITY_ROOT_USERPROFILE
+    }
+    try {
+        $regDesktop = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders" -Name "Desktop" -ErrorAction Stop).Desktop
+        if ($regDesktop) {
+            $parent = Split-Path $regDesktop -Parent
+            if (Test-Path $parent) { return $parent }
+        }
+    } catch {}
+    if ($env:USERPROFILE -match '^(.*?)[\\/]\.config[\\/]multigravity[\\/]profiles') {
+        return $Matches[1]
+    }
+    return [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::UserProfile)
+}
+
+$ROOT_USERPROFILE = Get-CanonicalUserProfile
+$INSTALL_DIR = "$ROOT_USERPROFILE\.local\bin"
 
 function Write-Step ($message) {
     Write-Host "  -> $message"
@@ -38,7 +56,7 @@ if ($userPath -and $userPath -like "*$INSTALL_DIR*") {
 }
 
 # ── profile data (opt-in) ─────────────────────────────────────────────────────
-$profileBase = if ($env:MULTIGRAVITY_HOME) { $env:MULTIGRAVITY_HOME } else { "$env:USERPROFILE\.config\multigravity\profiles" }
+$profileBase = if ($env:MULTIGRAVITY_HOME) { $env:MULTIGRAVITY_HOME } else { "$ROOT_USERPROFILE\.config\multigravity\profiles" }
 if (Test-Path $profileBase) {
     Write-Host ""
     $confirm = Read-Host "Remove all profile data at '$profileBase'? [y/N]"

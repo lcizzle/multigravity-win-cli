@@ -17,10 +17,39 @@ param (
     [string[]]$ForwardArgs
 )
 
-$BASE = if ($env:MULTIGRAVITY_HOME) { $env:MULTIGRAVITY_HOME } else { "$env:USERPROFILE\.config\multigravity\profiles" }
+function Get-CanonicalUserProfile {
+    if ($env:MULTIGRAVITY_ROOT_USERPROFILE -and (Test-Path $env:MULTIGRAVITY_ROOT_USERPROFILE)) {
+        return $env:MULTIGRAVITY_ROOT_USERPROFILE
+    }
+    try {
+        $regDesktop = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders" -Name "Desktop" -ErrorAction Stop).Desktop
+        if ($regDesktop) {
+            $parent = Split-Path $regDesktop -Parent
+            if (Test-Path $parent) { return $parent }
+        }
+    } catch {}
+    if ($env:USERPROFILE -match '^(.*?)[\\/]\.config[\\/]multigravity[\\/]profiles') {
+        return $Matches[1]
+    }
+    return [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::UserProfile)
+}
+
+$ROOT_USERPROFILE = Get-CanonicalUserProfile
+
+function Get-BaseDir {
+    if ($env:MULTIGRAVITY_HOME) {
+        return $env:MULTIGRAVITY_HOME
+    }
+    return "$ROOT_USERPROFILE\.config\multigravity\profiles"
+}
+
+$BASE = Get-BaseDir
+$env:MULTIGRAVITY_ROOT_USERPROFILE = $ROOT_USERPROFILE
+$env:MULTIGRAVITY_HOME = $BASE
 
 function Find-Antigravity {
     $paths = @(
+        "$ROOT_USERPROFILE\AppData\Local\Programs\Antigravity\Antigravity.exe",
         "$env:LOCALAPPDATA\Programs\Antigravity\Antigravity.exe",
         "$env:PROGRAMFILES\Antigravity\Antigravity.exe",
         "${env:ProgramFiles(x86)}\Antigravity\Antigravity.exe"
@@ -43,24 +72,29 @@ $APP = if ($env:MULTIGRAVITY_APP) { $env:MULTIGRAVITY_APP } else { Find-Antigrav
 
 function Find-AntigravityCLI {
     $paths = @(
-        "$env:LOCALAPPDATA\Programs\Antigravity\bin\agy.cmd",
+        "$ROOT_USERPROFILE\AppData\Local\Programs\Antigravity\bin\agy.exe",
+        "$ROOT_USERPROFILE\AppData\Local\Programs\Antigravity CLI\agy.exe",
+        "$ROOT_USERPROFILE\AppData\Local\Programs\Antigravity CLI\bin\agy.exe",
+        "$ROOT_USERPROFILE\AppData\Local\Programs\Antigravity\bin\agy.cmd",
+        "$ROOT_USERPROFILE\AppData\Local\Programs\Antigravity CLI\bin\agy.cmd",
         "$env:LOCALAPPDATA\Programs\Antigravity\bin\agy.exe",
-        "$env:LOCALAPPDATA\Programs\Antigravity CLI\bin\agy.cmd",
         "$env:LOCALAPPDATA\Programs\Antigravity CLI\bin\agy.exe",
         "$env:LOCALAPPDATA\Programs\Antigravity CLI\agy.exe",
-        "$env:PROGRAMFILES\Antigravity\bin\agy.cmd",
+        "$env:LOCALAPPDATA\Programs\Antigravity\bin\agy.cmd",
+        "$env:LOCALAPPDATA\Programs\Antigravity CLI\bin\agy.cmd",
         "$env:PROGRAMFILES\Antigravity\bin\agy.exe",
-        "$env:PROGRAMFILES\Antigravity CLI\bin\agy.cmd",
         "$env:PROGRAMFILES\Antigravity CLI\bin\agy.exe",
-        "${env:ProgramFiles(x86)}\Antigravity\bin\agy.cmd",
-        "${env:ProgramFiles(x86)}\Antigravity\bin\agy.exe"
+        "$env:PROGRAMFILES\Antigravity\bin\agy.cmd",
+        "$env:PROGRAMFILES\Antigravity CLI\bin\agy.cmd",
+        "${env:ProgramFiles(x86)}\Antigravity\bin\agy.exe",
+        "${env:ProgramFiles(x86)}\Antigravity\bin\agy.cmd"
     )
     foreach ($p in $paths) {
         if (Test-Path $p) { return $p }
     }
     
-    # Try to find in PATH
-    $cmdObj = Get-Command agy.cmd, agy.exe, agy -ErrorAction SilentlyContinue
+    # Try to find in PATH (prefer .exe)
+    $cmdObj = Get-Command agy.exe, agy.cmd, agy -ErrorAction SilentlyContinue
     if ($cmdObj) {
         if ($cmdObj -is [array]) { return $cmdObj[0].Source }
         return $cmdObj.Source
@@ -76,15 +110,15 @@ function Get-TemplatesDir {
 }
 
 function Get-SystemDataDir {
-    return "$env:APPDATA\Antigravity"
+    return "$ROOT_USERPROFILE\AppData\Roaming\Antigravity"
 }
 
 function Get-SystemExtensionsDir {
-    return "$env:USERPROFILE\.antigravity\extensions"
+    return "$ROOT_USERPROFILE\.antigravity\extensions"
 }
 
 function Get-SystemGeminiDir {
-    return "$env:USERPROFILE\.gemini"
+    return "$ROOT_USERPROFILE\.gemini"
 }
 
 if (-not ([System.Management.Automation.PSTypeName]'MultigravityCredVault').Type) {
@@ -188,9 +222,17 @@ public class MultigravityCredVault {
 "@ -ErrorAction SilentlyContinue
 }
 
-$TARGET_CRED_NAME = "gemini:antigravity"
+function Get-TargetCredName {
+    if ($env:MULTIGRAVITY_TEST_CRED_TARGET) {
+        return $env:MULTIGRAVITY_TEST_CRED_TARGET
+    }
+    return "gemini:antigravity"
+}
+
+$TARGET_CRED_NAME = Get-TargetCredName
 
 function Get-GlobalProfile {
+    $BASE = Get-BaseDir
     $globalFile = "$BASE\.global_profile"
     if (Test-Path $globalFile) {
         $g = (Get-Content $globalFile -Raw).Trim()
@@ -203,6 +245,7 @@ function Get-GlobalProfile {
 
 function Set-GlobalProfile {
     param($PROFILE)
+    $BASE = Get-BaseDir
     if ([string]::IsNullOrWhiteSpace($PROFILE)) {
         Write-Error "Error: profile name required"
         exit 1
@@ -226,6 +269,7 @@ function Set-GlobalProfile {
 }
 
 function Unset-GlobalProfile {
+    $BASE = Get-BaseDir
     $globalFile = "$BASE\.global_profile"
     if (Test-Path $globalFile) {
         Remove-Item $globalFile -Force -ErrorAction SilentlyContinue
@@ -239,6 +283,8 @@ function Unset-GlobalProfile {
 
 function Save-GlobalCredential {
     param($PROFILE)
+    $BASE = Get-BaseDir
+    $credTarget = Get-TargetCredName
     if ($PROFILE) {
         Set-GlobalProfile $PROFILE
     }
@@ -246,7 +292,7 @@ function Save-GlobalCredential {
         New-Item -ItemType Directory -Force -Path $BASE | Out-Null
     }
     $user = $null
-    $blob = [MultigravityCredVault]::ExportCredential($TARGET_CRED_NAME, [ref]$user)
+    $blob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$user)
     if ($blob) {
         $credPath = "$BASE\.global_credentials.json"
         $data = @{
@@ -260,12 +306,13 @@ function Save-GlobalCredential {
         Write-Host "Saved global credential$nameInfo."
         return $true
     } else {
-        Write-Host "No active credential found in Windows Credential Manager under '$TARGET_CRED_NAME'."
+        Write-Host "No active credential found in Windows Credential Manager under '$credTarget'."
         return $false
     }
 }
 
 function Remove-GlobalCredential {
+    $BASE = Get-BaseDir
     $credPath = "$BASE\.global_credentials.json"
     if (Test-Path $credPath) {
         Remove-Item $credPath -Force
@@ -277,6 +324,8 @@ function Remove-GlobalCredential {
 
 function Save-CredentialToProfile {
     param($PROFILE)
+    $BASE = Get-BaseDir
+    $credTarget = Get-TargetCredName
     $g = Get-GlobalProfile
     if ($g -and $g -eq $PROFILE) {
         Save-GlobalCredential $PROFILE | Out-Null
@@ -288,7 +337,7 @@ function Save-CredentialToProfile {
         exit 1
     }
     $user = $null
-    $blob = [MultigravityCredVault]::ExportCredential($TARGET_CRED_NAME, [ref]$user)
+    $blob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$user)
     if ($blob) {
         $credPath = "$profileDir\.credentials.json"
         $data = @{
@@ -300,13 +349,14 @@ function Save-CredentialToProfile {
         Write-Host "Saved credential to profile '$PROFILE'"
         return $true
     } else {
-        Write-Host "No active credential found in Windows Credential Manager under '$TARGET_CRED_NAME'."
+        Write-Host "No active credential found in Windows Credential Manager under '$credTarget'."
         return $false
     }
 }
 
 function Remove-ProfileCredential {
     param($PROFILE)
+    $BASE = Get-BaseDir
     $g = Get-GlobalProfile
     if ($g -and $g -eq $PROFILE) {
         Remove-GlobalCredential
@@ -327,12 +377,14 @@ function Remove-ProfileCredential {
 }
 
 function Restore-GlobalCredential {
+    $BASE = Get-BaseDir
+    $credTarget = Get-TargetCredName
     $globalCredPath = "$BASE\.global_credentials.json"
     if (Test-Path $globalCredPath) {
         try {
             $json = Get-Content $globalCredPath -Raw | ConvertFrom-Json
             if ($json.blob) {
-                [MultigravityCredVault]::ImportCredential($TARGET_CRED_NAME, $json.userName, $json.blob) | Out-Null
+                [MultigravityCredVault]::ImportCredential($credTarget, $json.userName, $json.blob) | Out-Null
                 $gName = Get-GlobalProfile
                 $nameInfo = if ($gName) { " ('$gName')" } else { "" }
                 Write-Host "Restored global profile credential vault$nameInfo."
@@ -345,19 +397,29 @@ function Restore-GlobalCredential {
             }
         } catch {}
     }
-    [MultigravityCredVault]::RemoveCredential($TARGET_CRED_NAME) | Out-Null
+    [MultigravityCredVault]::RemoveCredential($credTarget) | Out-Null
     Write-Host "Cleared credential vault (no global credential to restore)."
     Remove-Item "$BASE\.active_profile" -Force -ErrorAction SilentlyContinue
 }
 
 function Prepare-LaunchCredential {
     param($PROFILE)
+    $BASE = Get-BaseDir
+    $credTarget = Get-TargetCredName
     $profileDir = "$BASE\$PROFILE"
     $credPath   = "$profileDir\.credentials.json"
     
     if (!(Test-Path $BASE)) {
         New-Item -ItemType Directory -Force -Path $BASE | Out-Null
     }
+
+    # Maintain environment variable call stack for clean nested re-entrancy
+    $currentActive = if ($env:MULTIGRAVITY_ACTIVE_PROFILE) { $env:MULTIGRAVITY_ACTIVE_PROFILE } else { (Get-GlobalProfile) }
+    if ($currentActive -and $currentActive -ne $PROFILE) {
+        $stack = if ($env:MULTIGRAVITY_PROFILE_STACK) { $env:MULTIGRAVITY_PROFILE_STACK } else { "" }
+        $env:MULTIGRAVITY_PROFILE_STACK = if ($stack) { "$stack;$currentActive" } else { $currentActive }
+    }
+    $env:MULTIGRAVITY_ACTIVE_PROFILE = $PROFILE
     Set-Content -Path "$BASE\.active_profile" -Value $PROFILE -Encoding UTF8
 
     $hadSavedCred = Test-Path $credPath
@@ -366,14 +428,14 @@ function Prepare-LaunchCredential {
         try {
             $json = Get-Content $credPath -Raw | ConvertFrom-Json
             if ($json.blob) {
-                [MultigravityCredVault]::ImportCredential($TARGET_CRED_NAME, $json.userName, $json.blob) | Out-Null
+                [MultigravityCredVault]::ImportCredential($credTarget, $json.userName, $json.blob) | Out-Null
                 Write-Host "Restored credential vault for profile '$PROFILE'"
             }
         } catch {
             Write-Host "Warning: Could not parse stored credential for profile '$PROFILE'"
         }
     } else {
-        [MultigravityCredVault]::RemoveCredential($TARGET_CRED_NAME) | Out-Null
+        [MultigravityCredVault]::RemoveCredential($credTarget) | Out-Null
         Write-Host "Profile '$PROFILE' starting with fresh credential state (login required)."
     }
 
@@ -382,32 +444,65 @@ function Prepare-LaunchCredential {
 
 function Restore-PostLaunchCredential {
     param($PROFILE, [bool]$HadSavedCred)
+    $BASE = Get-BaseDir
+    $credTarget = Get-TargetCredName
     $globalProfile = Get-GlobalProfile
     $isGlobal = ($globalProfile -and $globalProfile -eq $PROFILE)
 
     if ($isGlobal) {
         Save-GlobalCredential $PROFILE | Out-Null
     } else {
-        if (!$HadSavedCred) {
-            $user = $null
-            $blob = [MultigravityCredVault]::ExportCredential($TARGET_CRED_NAME, [ref]$user)
-            if ($blob) {
-                $credPath = "$BASE\$PROFILE\.credentials.json"
-                $data = @{
-                    userName = $user
-                    blob     = $blob
-                    updated  = (Get-Date).ToString("o")
-                } | ConvertTo-Json
-                Set-Content -Path $credPath -Value $data -Encoding UTF8
-                Write-Host "Saved new credential for profile '$PROFILE'"
+        # 1. Capture refreshed/updated token back to profile storage
+        $user = $null
+        $blob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$user)
+        $credPath = "$BASE\$PROFILE\.credentials.json"
+        if ($blob) {
+            $data = @{
+                userName = $user
+                blob     = $blob
+                updated  = (Get-Date).ToString("o")
+            } | ConvertTo-Json
+            Set-Content -Path $credPath -Value $data -Encoding UTF8
+            Write-Host "Saved credential for profile '$PROFILE'"
+        } else {
+            # User logged out during session; clean up stale credential file
+            if (Test-Path $credPath) {
+                Remove-Item $credPath -Force -ErrorAction SilentlyContinue
+                Write-Host "Cleared saved credential for profile '$PROFILE' (logged out)."
             }
         }
-        Restore-GlobalCredential
+
+        # 2. Re-entrant restoration: Pop parent profile from environment stack if nested, otherwise global
+        if ($env:MULTIGRAVITY_PROFILE_STACK) {
+            $stackItems = $env:MULTIGRAVITY_PROFILE_STACK -split ';'
+            $parentProfile = $stackItems[-1]
+            $remainingStack = if ($stackItems.Length -gt 1) { ($stackItems[0..($stackItems.Length - 2)]) -join ';' } else { $null }
+            $env:MULTIGRAVITY_PROFILE_STACK = $remainingStack
+            $env:MULTIGRAVITY_ACTIVE_PROFILE = $parentProfile
+
+            if ($parentProfile -and (Test-Path "$BASE\$parentProfile\.credentials.json")) {
+                try {
+                    $pJson = Get-Content "$BASE\$parentProfile\.credentials.json" -Raw | ConvertFrom-Json
+                    if ($pJson.blob) {
+                        [MultigravityCredVault]::ImportCredential($credTarget, $pJson.userName, $pJson.blob) | Out-Null
+                        Write-Host "Restored parent credential vault for profile '$parentProfile'"
+                    }
+                } catch {}
+            } elseif ($parentProfile -and $parentProfile -eq (Get-GlobalProfile)) {
+                Restore-GlobalCredential
+            }
+            Set-Content -Path "$BASE\.active_profile" -Value $parentProfile -Encoding UTF8
+        } else {
+            $env:MULTIGRAVITY_ACTIVE_PROFILE = $null
+            $env:MULTIGRAVITY_PROFILE_STACK = $null
+            Restore-GlobalCredential
+        }
     }
 }
 
 function Test-SharedProfile {
     param($name)
+    $BASE = Get-BaseDir
     return Test-Path "$BASE\$name\.shared"
 }
 
@@ -546,7 +641,12 @@ function New-SharedFileLink {
         try {
             New-Item -ItemType HardLink -Path $dest -Target $src -ErrorAction Stop | Out-Null
             $linked = $true
-        } catch {}
+        } catch {
+            try {
+                Copy-Item -Path $src -Destination $dest -Force -ErrorAction Stop
+                $linked = $true
+            } catch {}
+        }
     }
 
     return $linked
@@ -636,7 +736,7 @@ function Sync-SharedProfile {
             }
         } else {
             if (!(New-SharedFileLink -src $src -dest $dest)) {
-                Write-Warning "Failed to link '$f' for shared profile '$name'. Shared profiles require Administrator privileges or Developer Mode on Windows."
+                Write-Warning "Failed to link '$f' for shared profile '$name'."
             }
         }
     }
@@ -650,10 +750,17 @@ function Sync-SharedProfile {
     if (!(Test-Path $profGlobalStorage)) {
         New-Item -ItemType Directory -Force -Path $profGlobalStorage | Out-Null
     }
-    $authExclusions = @("state.vscdb", "state.vscdb.backup", "storage.json", "secrets.json")
+    $authExclusionPatterns = @("state.vscdb*", "storage.json*", "secrets.json*", "lockfile*")
     $items = Get-ChildItem -Path $sysGlobalStorage -ErrorAction SilentlyContinue
     foreach ($item in $items) {
-        if ($authExclusions -contains $item.Name) { continue }
+        $isExcluded = $false
+        foreach ($pat in $authExclusionPatterns) {
+            if ($item.Name -like $pat) {
+                $isExcluded = $true
+                break
+            }
+        }
+        if ($isExcluded) { continue }
         $destItem = "$profGlobalStorage\$($item.Name)"
         if ($item.PSIsContainer) {
             if (!(New-SharedDirJunction -src $item.FullName -dest $destItem)) {
@@ -661,7 +768,7 @@ function Sync-SharedProfile {
             }
         } else {
             if (!(New-SharedFileLink -src $item.FullName -dest $destItem)) {
-                Write-Warning "Failed to link '$($item.Name)' for shared profile '$name'. Shared profiles require Administrator privileges or Developer Mode on Windows."
+                Write-Warning "Failed to link '$($item.Name)' for shared profile '$name'."
             }
         }
     }
@@ -691,6 +798,7 @@ function Invoke-LaunchProfile {
 
     $gProf = Get-GlobalProfile
     $isGlobal = ($gProf -and $gProf -eq $PROFILE)
+    $isShared = Test-SharedProfile $PROFILE
 
     if ($isGlobal) {
         Write-Host "Launching Antigravity Desktop App for global profile '$PROFILE'"
@@ -718,7 +826,7 @@ function Invoke-LaunchProfile {
 
     Write-Host "Launching Antigravity Desktop App for profile '$PROFILE'"
     
-    if (Test-SharedProfile $PROFILE) {
+    if ($isShared) {
         Sync-SharedProfile $PROFILE
     }
 
@@ -729,10 +837,6 @@ function Invoke-LaunchProfile {
     $oldLocalAppData = $env:LOCALAPPDATA
 
     try {
-        $env:USERPROFILE  = $PROFILE_DIR
-        $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
-        $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
-        
         $userDataDir = "$PROFILE_DIR\AppData\Roaming\Antigravity"
         $extDir = "$PROFILE_DIR\.antigravity\extensions"
 
@@ -746,11 +850,20 @@ function Invoke-LaunchProfile {
             $launchArgs += ($ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" })
         }
 
+        # For shared profiles, run in native Windows user environment so internal terminals have full host access
+        if (!$isShared) {
+            $env:USERPROFILE  = $PROFILE_DIR
+            $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
+            $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
+        }
+
         Start-Process -FilePath $APP -ArgumentList $launchArgs -Wait
     } finally {
-        $env:USERPROFILE  = $oldUserProfile
-        $env:APPDATA      = $oldAppData
-        $env:LOCALAPPDATA = $oldLocalAppData
+        if (!$isShared) {
+            $env:USERPROFILE  = $oldUserProfile
+            $env:APPDATA      = $oldAppData
+            $env:LOCALAPPDATA = $oldLocalAppData
+        }
 
         Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred
     }
@@ -770,6 +883,7 @@ function Invoke-LaunchCLIProfile {
 
     $gProf = Get-GlobalProfile
     $isGlobal = ($gProf -and $gProf -eq $PROFILE)
+    $isShared = Test-SharedProfile $PROFILE
 
     if ($isGlobal) {
         Write-Host "Launching Antigravity CLI for global profile '$PROFILE'"
@@ -798,36 +912,58 @@ function Invoke-LaunchCLIProfile {
 
     Write-Host "Launching Antigravity CLI for profile '$PROFILE'"
     
-    if (Test-SharedProfile $PROFILE) {
+    if ($isShared) {
         Sync-SharedProfile $PROFILE
     }
 
-    $hadSavedCred = Prepare-LaunchCredential $PROFILE
+    $cleanForwardArgs = if ($ArgsToForward) {
+        $ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" }
+    } else { $null }
 
-    $oldUserProfile  = $env:USERPROFILE
-    $oldAppData      = $env:APPDATA
-    $oldLocalAppData = $env:LOCALAPPDATA
+    # Mutex synchronization for credential vault swapping across processes
+    $vaultMutex = $null
+    $hasMutexLock = $false
+    try {
+        $vaultMutex = New-Object System.Threading.Mutex($false, "Global\Multigravity_Vault_Mutex")
+        $hasMutexLock = $vaultMutex.WaitOne(30000) # 30s timeout
+    } catch {}
 
     try {
-        $env:USERPROFILE  = $PROFILE_DIR
-        $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
-        $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
+        $hadSavedCred = Prepare-LaunchCredential $PROFILE
 
-        $cleanForwardArgs = if ($ArgsToForward) {
-            $ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" }
-        } else { $null }
+        $oldUserProfile  = $env:USERPROFILE
+        $oldAppData      = $env:APPDATA
+        $oldLocalAppData = $env:LOCALAPPDATA
 
-        if ($cleanForwardArgs) {
-            & $CLI_APP @cleanForwardArgs
-        } else {
-            & $CLI_APP
+        try {
+            # For shared profiles, run in native Windows user environment (USERPROFILE, APPDATA, LOCALAPPDATA intact)
+            if (!$isShared) {
+                $env:USERPROFILE  = $PROFILE_DIR
+                $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
+                $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
+            }
+
+            if ($cleanForwardArgs) {
+                & $CLI_APP @cleanForwardArgs
+            } else {
+                & $CLI_APP
+            }
+        } finally {
+            if (!$isShared) {
+                $env:USERPROFILE  = $oldUserProfile
+                $env:APPDATA      = $oldAppData
+                $env:LOCALAPPDATA = $oldLocalAppData
+            }
+
+            Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred
         }
     } finally {
-        $env:USERPROFILE  = $oldUserProfile
-        $env:APPDATA      = $oldAppData
-        $env:LOCALAPPDATA = $oldLocalAppData
-
-        Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred
+        if ($vaultMutex -and $hasMutexLock) {
+            try { $vaultMutex.ReleaseMutex() } catch {}
+        }
+        if ($vaultMutex) {
+            try { $vaultMutex.Dispose() } catch {}
+        }
     }
 }
 
@@ -1143,6 +1279,10 @@ function Invoke-DoctorCli {
 
     Write-Host "Checking multigravity environment..."
 
+    # 0. Canonical Root User Profile
+    Write-Host "  [OK] Host User Profile: $ROOT_USERPROFILE"
+    Write-Host "  [OK] Profile Base Dir: $BASE"
+
     # 1. Antigravity Desktop Installation
     if ($APP -and (Test-Path $APP)) {
         Write-Host "  [OK] Antigravity Desktop App: Found at $APP"
@@ -1200,9 +1340,15 @@ function Invoke-DoctorCli {
         if ($sharedProfiles) {
             foreach ($sp in $sharedProfiles) {
                 Sync-SharedProfile $sp.Name
-                Write-Host "  [OK] Shared Profile '$($sp.Name)': Extensions & settings synced"
+                Write-Host "  [OK] Shared Profile '$($sp.Name)': Extensions, .gemini & settings synced (native host shell)"
             }
         }
+    }
+
+    # 6. Active Profile & Re-entrancy Stack
+    if (Test-Path "$BASE\.active_profile") {
+        $act = (Get-Content "$BASE\.active_profile" -Raw).Trim()
+        Write-Host "  [INFO] Active profile indicator: $act"
     }
 
     Write-Host ""

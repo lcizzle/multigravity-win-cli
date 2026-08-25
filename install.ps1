@@ -1,9 +1,27 @@
 $ErrorActionPreference = "Stop"
 
+function Get-CanonicalUserProfile {
+    if ($env:MULTIGRAVITY_ROOT_USERPROFILE -and (Test-Path $env:MULTIGRAVITY_ROOT_USERPROFILE)) {
+        return $env:MULTIGRAVITY_ROOT_USERPROFILE
+    }
+    try {
+        $regDesktop = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders" -Name "Desktop" -ErrorAction Stop).Desktop
+        if ($regDesktop) {
+            $parent = Split-Path $regDesktop -Parent
+            if (Test-Path $parent) { return $parent }
+        }
+    } catch {}
+    if ($env:USERPROFILE -match '^(.*?)[\\/]\.config[\\/]multigravity[\\/]profiles') {
+        return $Matches[1]
+    }
+    return [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::UserProfile)
+}
+
+$ROOT_USERPROFILE = Get-CanonicalUserProfile
 $REPO = "lcizzle/multigravity-win-cli"
 $BRANCH = "main"
 $RAW = "https://raw.githubusercontent.com/$REPO/$BRANCH"
-$INSTALL_DIR = "$env:USERPROFILE\.local\bin"
+$INSTALL_DIR = "$ROOT_USERPROFILE\.local\bin"
 
 function Write-Step ($message) {
     Write-Host "  -> $message"
