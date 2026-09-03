@@ -231,6 +231,35 @@ function Get-TargetCredName {
 
 $TARGET_CRED_NAME = Get-TargetCredName
 
+function Test-CredentialFileValid {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or !(Test-Path $Path)) {
+        return $false
+    }
+    try {
+        $json = Get-Content $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($json.blob)) {
+            return $false
+        }
+        $rawBytes = [System.Convert]::FromBase64String($json.blob)
+        return ($rawBytes.Length -gt 0)
+    } catch {
+        return $false
+    }
+}
+
+function Test-ProfileHasValidCredential {
+    param($PROFILE)
+    $BASE = Get-BaseDir
+    $gProf = Get-GlobalProfile
+    if ($gProf -and $gProf -eq $PROFILE) {
+        $credPath = "$BASE\.global_credentials.json"
+        if (Test-CredentialFileValid $credPath) { return $true }
+    }
+    $credPath = "$BASE\$PROFILE\.credentials.json"
+    return (Test-CredentialFileValid $credPath)
+}
+
 function Get-GlobalProfile {
     $BASE = Get-BaseDir
     $globalFile = "$BASE\.global_profile"
@@ -422,19 +451,23 @@ function Prepare-LaunchCredential {
     $env:MULTIGRAVITY_ACTIVE_PROFILE = $PROFILE
     Set-Content -Path "$BASE\.active_profile" -Value $PROFILE -Encoding UTF8
 
-    $hadSavedCred = Test-Path $credPath
-
-    if ($hadSavedCred) {
+    $hadSavedCred = $false
+    if (Test-CredentialFileValid $credPath) {
         try {
-            $json = Get-Content $credPath -Raw | ConvertFrom-Json
-            if ($json.blob) {
-                [MultigravityCredVault]::ImportCredential($credTarget, $json.userName, $json.blob) | Out-Null
-                Write-Host "Restored credential vault for profile '$PROFILE'"
+            $json = Get-Content $credPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if (![string]::IsNullOrWhiteSpace($json.blob)) {
+                $importOk = [MultigravityCredVault]::ImportCredential($credTarget, $json.userName, $json.blob)
+                if ($importOk) {
+                    Write-Host "Restored credential vault for profile '$PROFILE'"
+                    $hadSavedCred = $true
+                }
             }
         } catch {
             Write-Host "Warning: Could not parse stored credential for profile '$PROFILE'"
         }
-    } else {
+    }
+
+    if (!$hadSavedCred) {
         [MultigravityCredVault]::RemoveCredential($credTarget) | Out-Null
         Write-Host "Profile '$PROFILE' starting with fresh credential state (login required)."
     }
@@ -450,26 +483,28 @@ function Restore-PostLaunchCredential {
     $isGlobal = ($globalProfile -and $globalProfile -eq $PROFILE)
 
     if ($isGlobal) {
-        Save-GlobalCredential $PROFILE | Out-Null
-    } else {
-        # 1. Capture refreshed/updated token back to profile storage
-        $user = $null
-        $blob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$user)
-        $credPath = "$BASE\$PROFILE\.credentials.json"
-        if ($blob) {
-            $data = @{
-                userName = $user
-                blob     = $blob
-                updated  = (Get-Date).ToString("o")
-            } | ConvertTo-Json
-            Set-Content -Path $credPath -Value $data -Encoding UTF8
-            Write-Host "Saved credential for profile '$PROFILE'"
+        if (!$HadSavedCred -and !(Test-ProfileHasValidCredential $PROFILE)) {
+            Save-GlobalCredential $PROFILE | Out-Null
         } else {
-            # User logged out during session; clean up stale credential file
-            if (Test-Path $credPath) {
-                Remove-Item $credPath -Force -ErrorAction SilentlyContinue
-                Write-Host "Cleared saved credential for profile '$PROFILE' (logged out)."
+            Write-Host "Global profile '$PROFILE' credential file is valid; skipping resave on exit."
+        }
+    } else {
+        $credPath = "$BASE\$PROFILE\.credentials.json"
+        if (!$HadSavedCred -and !(Test-ProfileHasValidCredential $PROFILE)) {
+            # Only save initial credential if the profile did not have valid credentials before
+            $user = $null
+            $blob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$user)
+            if ($blob) {
+                $data = @{
+                    userName = $user
+                    blob     = $blob
+                    updated  = (Get-Date).ToString("o")
+                } | ConvertTo-Json
+                Set-Content -Path $credPath -Value $data -Encoding UTF8
+                Write-Host "Saved initial credential for profile '$PROFILE'"
             }
+        } else {
+            Write-Host "Profile '$PROFILE' credential file is valid; skipping resave on exit."
         }
 
         # 2. Re-entrant restoration: Pop parent profile from environment stack if nested, otherwise global
@@ -802,6 +837,7 @@ function Invoke-LaunchProfile {
 
     if ($isGlobal) {
         Write-Host "Launching Antigravity Desktop App for global profile '$PROFILE'"
+        $hadGlobalCred = Test-CredentialFileValid "$BASE\.global_credentials.json"
         Restore-GlobalCredential
         try {
             $launchArgs = if ($ArgsToForward) {
@@ -813,7 +849,11 @@ function Invoke-LaunchProfile {
                 Start-Process -FilePath $APP -Wait
             }
         } finally {
-            Save-GlobalCredential $PROFILE | Out-Null
+            if (!$hadGlobalCred) {
+                Save-GlobalCredential $PROFILE | Out-Null
+            } else {
+                Write-Host "Global profile '$PROFILE' credential file is valid; skipping resave on exit."
+            }
         }
         return
     }
@@ -887,6 +927,7 @@ function Invoke-LaunchCLIProfile {
 
     if ($isGlobal) {
         Write-Host "Launching Antigravity CLI for global profile '$PROFILE'"
+        $hadGlobalCred = Test-CredentialFileValid "$BASE\.global_credentials.json"
         Restore-GlobalCredential
         try {
             $cleanForwardArgs = if ($ArgsToForward) {
@@ -899,7 +940,11 @@ function Invoke-LaunchCLIProfile {
                 & $CLI_APP
             }
         } finally {
-            Save-GlobalCredential $PROFILE | Out-Null
+            if (!$hadGlobalCred) {
+                Save-GlobalCredential $PROFILE | Out-Null
+            } else {
+                Write-Host "Global profile '$PROFILE' credential file is valid; skipping resave on exit."
+            }
         }
         return
     }

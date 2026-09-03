@@ -134,6 +134,50 @@ try {
     Restore-PostLaunchCredential -PROFILE "prof1" -HadSavedCred $true
     Assert-True ([string]::IsNullOrEmpty($env:MULTIGRAVITY_ACTIVE_PROFILE)) "Active profile cleared after root exit"
 
+    # 5. Verify Credential Pollution Prevention (Pre-existing credentials must NOT be overwritten on exit)
+    $prof1BlobBefore = (Get-Content "$prof1Dir\.credentials.json" -Raw | ConvertFrom-Json).blob
+    $hadProf1 = Prepare-LaunchCredential "prof1"
+    Assert-True $hadProf1 "prof1 launched with pre-existing valid credential"
+    # Simulate concurrent profile or restore swapping vault to alien credential
+    $alienBlob = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("alien_token_corrupted"))
+    [MultigravityCredVault]::ImportCredential($testCredTarget, "alien_user", $alienBlob) | Out-Null
+    # When prof1 exits, it must NOT save alien_user over its own credentials
+    Restore-PostLaunchCredential -PROFILE "prof1" -HadSavedCred $hadProf1
+    $prof1JsonAfter = Get-Content "$prof1Dir\.credentials.json" -Raw | ConvertFrom-Json
+    Assert-Equal $prof1JsonAfter.userName "prof1_user" "prof1 credentials NOT overwritten on exit"
+    Assert-Equal $prof1JsonAfter.blob $prof1BlobBefore "prof1 credential blob preserved intact"
+    Assert-True ($prof1JsonAfter.blob -ne $alienBlob) "prof1 credential blob is not corrupted by alien token"
+
+    # 6. Verify Initial Login Save Behavior for Fresh Profile
+    $profFreshDir = "$testBase\prof_fresh"
+    New-Item -ItemType Directory -Force -Path $profFreshDir | Out-Null
+    $hadFresh = Prepare-LaunchCredential "prof_fresh"
+    Assert-True (!$hadFresh) "prof_fresh has no credentials initially"
+    # Simulate user signing in during session
+    $freshBlob = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("fresh_token_12345"))
+    [MultigravityCredVault]::ImportCredential($testCredTarget, "fresh_user", $freshBlob) | Out-Null
+    # Exit fresh profile - should save initial credential
+    Restore-PostLaunchCredential -PROFILE "prof_fresh" -HadSavedCred $hadFresh
+    Assert-True (Test-Path "$profFreshDir\.credentials.json") "prof_fresh saved initial credentials on exit"
+    $freshJson = Get-Content "$profFreshDir\.credentials.json" -Raw | ConvertFrom-Json
+    Assert-Equal $freshJson.userName "fresh_user" "prof_fresh saved correct initial username"
+
+    # 7. Verify Global Profile Protection
+    Set-Content -Path "$testBase\.global_profile" -Value "prof_global" -Encoding UTF8
+    $globalCredData = @{
+        userName = "global_user"
+        blob     = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("global_token_54321"))
+        updated  = (Get-Date).ToString("o")
+    } | ConvertTo-Json
+    Set-Content -Path "$testBase\.global_credentials.json" -Value $globalCredData -Encoding UTF8
+    Assert-True (Test-CredentialFileValid "$testBase\.global_credentials.json") "Global credentials file is valid"
+    # Simulate vault swap to alien credential while global was running
+    [MultigravityCredVault]::ImportCredential($testCredTarget, "alien_user", $alienBlob) | Out-Null
+    # When global profile exits with HadSavedCred = true, it must NOT overwrite .global_credentials.json
+    Restore-PostLaunchCredential -PROFILE "prof_global" -HadSavedCred $true
+    $globalJsonAfter = Get-Content "$testBase\.global_credentials.json" -Raw | ConvertFrom-Json
+    Assert-Equal $globalJsonAfter.userName "global_user" "Global credentials NOT overwritten on exit"
+
 } finally {
     [MultigravityCredVault]::RemoveCredential($testCredTarget) | Out-Null
     Remove-Item -Recurse -Force $testBase -ErrorAction SilentlyContinue
