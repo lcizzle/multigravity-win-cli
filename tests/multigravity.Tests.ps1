@@ -116,7 +116,7 @@ try {
     Assert-Equal $env:MULTIGRAVITY_ACTIVE_PROFILE "prof1" "prof1 is active profile"
     
     # 2. prof2 launched inside prof1
-    Prepare-LaunchCredential "prof2" | Out-Null
+    Prepare-LaunchCredential "prof2" -ForceSwitch | Out-Null
     Assert-Equal $env:MULTIGRAVITY_ACTIVE_PROFILE "prof2" "prof2 is now active profile"
     Assert-Equal $env:MULTIGRAVITY_PROFILE_STACK "prof1" "Profile stack holds prof1 as parent"
 
@@ -226,6 +226,295 @@ try {
 } finally {
     Remove-Item -Recurse -Force $sharedBase -ErrorAction SilentlyContinue
 }
+
+# ── Test Suite 5: Native Pipeline & Stdin Streaming Pass-Through ──
+Write-Host ""
+Write-Host "Suite 5: Native Pipeline & Stdin Streaming Pass-Through"
+
+$pipeBase = "$testRoot\mg_pipe_test_$PID"
+$mockCmd = "$pipeBase\mock_agy.cmd"
+$mockLog = "$pipeBase\mock.log"
+$mockStdin = "$pipeBase\stdin.log"
+$mockCallCount = "$pipeBase\call_count.log"
+
+$env:MULTIGRAVITY_HOME = "$pipeBase\profiles"
+$env:MULTIGRAVITY_CLI_APP = $mockCmd
+$env:MULTIGRAVITY_TEST_CRED_TARGET = "gemini:test_pipe_vault_$PID"
+
+try {
+    New-Item -ItemType Directory -Force -Path "$pipeBase\profiles\pipe_prof" | Out-Null
+
+    $mockPy = "$pipeBase\mock_agy.py"
+    $mockPyContent = @"
+import sys, os, msvcrt, ctypes
+from ctypes import wintypes
+
+call_file = r'$($mockCallCount -replace '\\', '/')'
+log_file = r'$($mockLog -replace '\\', '/')'
+stdin_file = r'$($mockStdin -replace '\\', '/')'
+exit_code = int(os.environ.get('MOCK_EXIT_CODE', 0))
+
+with open(call_file, 'a', encoding='utf-8') as f:
+    f.write('call\n')
+
+with open(log_file, 'w', encoding='utf-8') as f:
+    f.write(' '.join(sys.argv[1:]) + '\n')
+
+try:
+    h = msvcrt.get_osfhandle(sys.stdin.fileno())
+    avail = wintypes.DWORD()
+    if ctypes.windll.kernel32.PeekNamedPipe(h, None, 0, None, ctypes.byref(avail), None):
+        if avail.value > 0:
+            data = sys.stdin.buffer.read().decode('utf-8-sig')
+            with open(stdin_file, 'w', encoding='utf-8', newline='') as f:
+                f.write(data)
+except Exception:
+    pass
+
+sys.exit(exit_code)
+"@
+    Set-Content -Path $mockPy -Value $mockPyContent
+
+    $mockCmdContent = @"
+@echo off
+uv run python "$mockPy" %*
+"@
+    Set-Content -Path $mockCmd -Value $mockCmdContent
+
+    # 1. Pipeline Pass-Through & Single-Execution Verification (-p - stripped)
+    $pipeLines = @("streamed prompt line 1", "streamed prompt line 2", "streamed prompt line 3")
+    $pipeLines | & $MgScript cli pipe_prof -p -
+
+    $calls1 = (Get-Content $mockCallCount -ErrorAction SilentlyContinue).Count
+    Assert-Equal $calls1 1 "Pipeline input executes CLI profile exactly once (no per-line multi-execution)"
+
+    $args1 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
+    Assert-Equal $args1 "" "'-p -' flag is stripped when streaming pipeline input to CLI app"
+
+    $stdinContent = if (Test-Path $mockStdin) { (Get-Content $mockStdin -Raw).Trim() } else { "" }
+    $expectedStdin = ($pipeLines -join "`r`n")
+    Assert-Equal $stdinContent $expectedStdin "Full multi-line pipeline buffer correctly streamed into CLI stdin"
+
+    # 2. Interactive / Standard Non-Pipeline Invocation (no stdin pipe)
+    Remove-Item $mockCallCount, $mockLog, $mockStdin -Force -ErrorAction SilentlyContinue
+    & $MgScript cli pipe_prof arg_foo arg_bar
+
+    $calls2 = (Get-Content $mockCallCount -ErrorAction SilentlyContinue).Count
+    Assert-Equal $calls2 1 "Standard non-pipeline invocation executes CLI profile once"
+
+    $args2 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
+    Assert-Equal $args2 "arg_foo arg_bar" "Standard forward arguments correctly received"
+
+    Assert-True (!(Test-Path $mockStdin)) "Non-pipeline invocation does not pipe stdin stream"
+
+    # 3. Exit Code Forwarding
+    $env:MOCK_EXIT_CODE = 42
+    & $MgScript cli pipe_prof exit_check
+    Assert-Equal $LASTEXITCODE 42 "multigravity.ps1 forwards CLI non-zero exit code (42) back to caller"
+    $env:MOCK_EXIT_CODE = $null
+
+    # 4. 'agy' alias with pipeline streaming (-p - stripped)
+    Remove-Item $mockCallCount, $mockLog, $mockStdin -Force -ErrorAction SilentlyContinue
+    "single line prompt" | & $MgScript agy pipe_prof -p -
+    $calls3 = (Get-Content $mockCallCount -ErrorAction SilentlyContinue).Count
+    Assert-Equal $calls3 1 "'agy' alias executes CLI profile exactly once"
+    $args3 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
+    Assert-Equal $args3 "" "'agy' alias strips -p - when streaming pipeline"
+    $stdin3 = if (Test-Path $mockStdin) { (Get-Content $mockStdin -Raw).Trim() } else { "" }
+    Assert-Equal $stdin3 "single line prompt" "'agy' alias streams pipeline buffer"
+
+    # 5. Pipeline with additional arguments (preserves other flags while stripping -p -)
+    Remove-Item $mockCallCount, $mockLog, $mockStdin -Force -ErrorAction SilentlyContinue
+    "multi-arg prompt" | & $MgScript cli pipe_prof --verbose -p - --model gemini-2.5-pro
+    $args4 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
+    Assert-Equal $args4 "--verbose --model gemini-2.5-pro" "Other CLI flags preserved while stripping -p -"
+    $stdin4 = if (Test-Path $mockStdin) { (Get-Content $mockStdin -Raw).Trim() } else { "" }
+    Assert-Equal $stdin4 "multi-arg prompt" "Pipeline stream delivered alongside other flags"
+
+    # 6. Non-pipelined invocation with -p preserved
+    Remove-Item $mockCallCount, $mockLog, $mockStdin -Force -ErrorAction SilentlyContinue
+    & $MgScript cli pipe_prof -p "non-piped prompt"
+    $args5 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
+    Assert-Equal $args5 "-p non-piped prompt" "Non-pipelined -p argument preserved unchanged"
+    Assert-True (!(Test-Path $mockStdin)) "Non-pipelined execution does not stream stdin"
+
+} finally {
+    $env:MULTIGRAVITY_CLI_APP = $null
+    $env:MOCK_EXIT_CODE = $null
+    Remove-Item -Recurse -Force $pipeBase -ErrorAction SilentlyContinue
+}
+
+# ── Test Suite 6: Per-User Mutex Concurrency & Timeout ──
+Write-Host ""
+Write-Host "Suite 6: Per-User Mutex Concurrency & Timeout"
+$userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$mutexName = "Local\Multigravity_Vault_Mutex_$userSid"
+
+$job = Start-Job -ScriptBlock {
+    param($mName)
+    $m = [System.Threading.Mutex]::new($true, $mName)
+    Start-Sleep -Seconds 3
+    $m.ReleaseMutex()
+    $m.Dispose()
+} -ArgumentList $mutexName
+
+Start-Sleep -Milliseconds 600
+
+$prevTimeout = $env:MULTIGRAVITY_MUTEX_TIMEOUT_MS
+$env:MULTIGRAVITY_MUTEX_TIMEOUT_MS = 200
+$timedOut = $false
+try {
+    Invoke-WithVaultMutex { $true }
+} catch [MultigravityExitException] {
+    $timedOut = ($_.Exception.ExitCode -eq 1)
+} catch {
+    $timedOut = $true
+} finally {
+    $env:MULTIGRAVITY_MUTEX_TIMEOUT_MS = $prevTimeout
+    Wait-Job $job | Out-Null
+    Receive-Job $job | Out-Null
+    Remove-Job $job -Force | Out-Null
+}
+Assert-True $timedOut "Invoke-WithVaultMutex times out when mutex held concurrently"
+
+$acquiredAfterRelease = Invoke-WithVaultMutex { $true }
+Assert-True $acquiredAfterRelease "Invoke-WithVaultMutex acquires successfully after external release"
+
+# ── Test Suite 7: Instance Registry, Liveness & Displacement Stack ──
+Write-Host ""
+Write-Host "Suite 7: Instance Registry, Liveness & Displacement Stack"
+
+$proc = Get-Process -Id $PID
+$liveStart = $proc.StartTime.ToUniversalTime().ToString("o")
+$jitterStart = $proc.StartTime.AddSeconds(1.5).ToUniversalTime().ToString("o")
+$futureStart = $proc.StartTime.AddSeconds(10).ToUniversalTime().ToString("o")
+
+$liveInst = [PSCustomObject]@{
+    pid = $PID
+    profile = "test_live"
+    type = "cli"
+    started = $liveStart
+}
+Assert-True (Test-InstanceAlive $liveInst) "Test-InstanceAlive returns true for running process"
+
+$deadInst = [PSCustomObject]@{
+    pid = 999999
+    profile = "test_dead"
+    type = "cli"
+    started = $liveStart
+}
+Assert-True (!(Test-InstanceAlive $deadInst)) "Test-InstanceAlive returns false for dead process"
+
+$jitterInst = [PSCustomObject]@{
+    pid = $PID
+    profile = "test_jitter"
+    type = "cli"
+    started = $jitterStart
+}
+Assert-True (Test-InstanceAlive $jitterInst) "Test-InstanceAlive tolerates future start time within 2s jitter"
+
+$futureInst = [PSCustomObject]@{
+    pid = $PID
+    profile = "test_future"
+    type = "cli"
+    started = $futureStart
+}
+Assert-True (!(Test-InstanceAlive $futureInst)) "Test-InstanceAlive rejects future start time beyond 2s jitter"
+
+$suite7Base = "$testRoot\mg_inst_test_$PID"
+$env:MULTIGRAVITY_HOME = $suite7Base
+try {
+    New-Item -ItemType Directory -Force -Path $suite7Base | Out-Null
+    $regData = [PSCustomObject]@{
+        instances = @($deadInst, $liveInst)
+        profile_stack = @("test_live")
+        active_vault_profile = "test_live"
+    }
+    Save-ActiveInstancesRegistry $regData
+    $prunedReg = Get-ActiveInstancesRegistry
+    Assert-Equal $prunedReg.instances.Count 1 "Get-ActiveInstancesRegistry prunes dead process instances"
+    Assert-Equal $prunedReg.instances[0].pid $PID "Remaining instance is live process"
+} finally {
+    Remove-Item -Recurse -Force $suite7Base -ErrorAction SilentlyContinue
+}
+
+$suite7Base2 = "$testRoot\mg_mutex_test_$PID"
+$env:MULTIGRAVITY_HOME = $suite7Base2
+try {
+    New-Item -ItemType Directory -Force -Path "$suite7Base2\profA" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$suite7Base2\profB" | Out-Null
+    
+    Prepare-LaunchCredential -PROFILE "profA" -ProcessId $PID -ProcessType "cli" -StartTime $proc.StartTime | Out-Null
+    
+    $blocked = $false
+    try {
+        Prepare-LaunchCredential -PROFILE "profB"
+    } catch [MultigravityExitException] {
+        $blocked = ($_.Exception.ExitCode -eq 1)
+    } catch {
+        $blocked = $true
+    }
+    Assert-True $blocked "Prepare-LaunchCredential blocks distinct profile when another profile has active instances"
+
+    Prepare-LaunchCredential -PROFILE "profB" -ForceSwitch | Out-Null
+    Assert-Equal $env:MULTIGRAVITY_ACTIVE_PROFILE "profB" "Force-switch sets profB as active profile"
+    Assert-True ($env:MULTIGRAVITY_PROFILE_STACK -like "*profA*") "Displacement stack holds profA"
+    
+    Restore-PostLaunchCredential -PROFILE "profB" -HadSavedCred $false
+    Assert-Equal $env:MULTIGRAVITY_ACTIVE_PROFILE "profA" "Restores profA after profB exits"
+    
+    Restore-PostLaunchCredential -PROFILE "profA" -HadSavedCred $false -ProcessId $PID
+    Assert-True ([string]::IsNullOrEmpty($env:MULTIGRAVITY_ACTIVE_PROFILE)) "All profiles cleared from active state"
+} finally {
+    Remove-Item -Recurse -Force $suite7Base2 -ErrorAction SilentlyContinue
+}
+
+# ── Test Suite 8: Argument Preservation, Common Parameter Bypass & Route Mapping ──
+Write-Host ""
+Write-Host "Suite 8: Argument Preservation, Common Parameter Bypass & Route Mapping"
+
+$psExe = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh.exe" } else { "powershell.exe" }
+
+$helpRes = & $psExe -NoProfile -ExecutionPolicy Bypass -File $MgScript --help
+Assert-Equal $LASTEXITCODE 0 "Executing script with --help exits with code 0"
+
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$unknownRes = & $psExe -NoProfile -ExecutionPolicy Bypass -File $MgScript -unknownFlag 2>&1
+$ErrorActionPreference = $prevEap
+Assert-Equal $LASTEXITCODE 1 "Unknown option '-unknownFlag' exits with code 1"
+Assert-True (($unknownRes | Out-String) -like "*Unknown option*") "Error message reports unknown option"
+
+$legacyRes = & $psExe -NoProfile -ExecutionPolicy Bypass -File $MgScript -cmd "help"
+Assert-Equal $LASTEXITCODE 0 "Script accepts -cmd 'help' backwards-compatibility parameter"
+
+# ── Test Suite 9: Dot-Sourcing Isolation & Exception Flow ──
+Write-Host ""
+Write-Host "Suite 9: Dot-Sourcing Isolation & Exception Flow"
+
+Assert-True $script:IsDotSourced "Script detected it was dot-sourced"
+
+$caughtCode = $null
+try {
+    Exit-Multigravity 42
+} catch [MultigravityExitException] {
+    $caughtCode = $_.Exception.ExitCode
+}
+Assert-Equal $caughtCode 42 "Exit-Multigravity throws MultigravityExitException with code 42 under dot-sourcing"
+Assert-Equal $global:LASTEXITCODE 42 "LASTEXITCODE updated to 42 by Exit-Multigravity"
+
+$caughtZero = $null
+try {
+    Exit-Multigravity 0
+} catch [MultigravityExitException] {
+    $caughtZero = $_.Exception.ExitCode
+}
+Assert-Equal $caughtZero 0 "Exit-Multigravity throws MultigravityExitException with code 0 under dot-sourcing"
+
+try {
+    $null = . $MgScript -cmd "invalid_command_nonexistent" -ErrorAction SilentlyContinue 2>$null
+} catch {}
+Assert-Equal $global:LASTEXITCODE 1 "Dot-sourcing invalid command sets LASTEXITCODE to 1 without crashing host"
 
 # ── Cleanup Test Environment Variables ──
 $env:MULTIGRAVITY_HOME = $null

@@ -73,7 +73,15 @@ if ($localScript -and (Test-Path $localScript)) {
 Write-Step "Creating wrapper script..."
 $wrapper = @"
 @echo off
-powershell.exe -ExecutionPolicy Bypass -File "%~dp0multigravity.ps1" %*
+setlocal
+chcp 65001 >nul
+where.exe pwsh.exe >nul 2>&1
+if %ERRORLEVEL% equ 0 (
+    pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0multigravity.ps1" %*
+) else (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0multigravity.ps1" %*
+)
+exit /b %ERRORLEVEL%
 "@
 
 # Save wrapper as ASCII for widest compatibility with cmd.exe

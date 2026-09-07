@@ -3,19 +3,42 @@
 Run multiple Antigravity profiles at the same time.
 #>
 
+[CmdletBinding(PositionalBinding = $false)]
 param (
-    [Parameter(Position = 0, Mandatory = $false)]
+    [Parameter(Mandatory = $false, DontShow = $true)]
     [string]$cmd,
-    
-    [Parameter(Position = 1, Mandatory = $false)]
-    [string]$arg1,
 
-    [Parameter(Position = 2, Mandatory = $false)]
-    [string]$arg2,
+    [Parameter(Mandatory = $false, DontShow = $true)]
+    [string]$p,
+
+    [Parameter(ValueFromPipeline = $true)]
+    [psobject]$InputObject,
 
     [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$ForwardArgs
+    [string[]]$AllRawArgs
 )
+
+begin {
+    $script:IsDotSourced = ($MyInvocation.InvocationName -eq '.')
+
+    class MultigravityExitException : System.Exception {
+        [int]$ExitCode
+        MultigravityExitException([int]$code) : base("Exit: $code") {
+            $this.ExitCode = $code
+        }
+    }
+
+    function Exit-Multigravity {
+        param([int]$Code = 0)
+        $global:LASTEXITCODE = $Code
+        if (-not $script:IsDotSourced) {
+            exit $Code
+        } else {
+            throw [MultigravityExitException]::new($Code)
+        }
+    }
+
+    $pipelineBuffer = [System.Collections.Generic.List[string]]::new()
 
 function Get-CanonicalUserProfile {
     if ($env:MULTIGRAVITY_ROOT_USERPROFILE -and (Test-Path $env:MULTIGRAVITY_ROOT_USERPROFILE)) {
@@ -277,11 +300,11 @@ function Set-GlobalProfile {
     $BASE = Get-BaseDir
     if ([string]::IsNullOrWhiteSpace($PROFILE)) {
         Write-Error "Error: profile name required"
-        exit 1
+        Exit-Multigravity 1
     }
     if ($PROFILE -notmatch "^[a-zA-Z0-9][a-zA-Z0-9-]*$") {
         Write-Error "Error: profile name must start with alphanumeric and contain only letters, numbers, or hyphens"
-        exit 1
+        Exit-Multigravity 1
     }
     if (!(Test-Path $BASE)) {
         New-Item -ItemType Directory -Force -Path $BASE | Out-Null
@@ -363,7 +386,7 @@ function Save-CredentialToProfile {
     $profileDir = "$BASE\$PROFILE"
     if (!(Test-Path $profileDir)) {
         Write-Error "Error: profile '$PROFILE' does not exist"
-        exit 1
+        Exit-Multigravity 1
     }
     $user = $null
     $blob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$user)
@@ -394,7 +417,7 @@ function Remove-ProfileCredential {
     $profileDir = "$BASE\$PROFILE"
     if (!(Test-Path $profileDir)) {
         Write-Error "Error: profile '$PROFILE' does not exist"
-        exit 1
+        Exit-Multigravity 1
     }
     $credPath = "$profileDir\.credentials.json"
     if (Test-Path $credPath) {
@@ -431,8 +454,127 @@ function Restore-GlobalCredential {
     Remove-Item "$BASE\.active_profile" -Force -ErrorAction SilentlyContinue
 }
 
+function Invoke-WithVaultMutex {
+    param([scriptblock]$Action)
+    $timeoutMs = if ($env:MULTIGRAVITY_MUTEX_TIMEOUT_MS) { [int]$env:MULTIGRAVITY_MUTEX_TIMEOUT_MS } else { 10000 }
+    $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $mutexName = "Local\Multigravity_Vault_Mutex_$userSid"
+    
+    $mutex = $null
+    $acquired = $false
+    try {
+        $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+        try {
+            $acquired = $mutex.WaitOne($timeoutMs)
+        } catch [System.Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            Write-Error "Error: Timeout acquiring Multigravity credential vault mutex after ${timeoutMs}ms. Another process is actively modifying the vault."
+            Exit-Multigravity 1
+        }
+        & $Action
+    } finally {
+        if ($mutex -and $acquired) {
+            try { $mutex.ReleaseMutex() } catch {}
+        }
+        if ($mutex) {
+            try { $mutex.Dispose() } catch {}
+        }
+    }
+}
+
+function Test-InstanceAlive {
+    param([pscustomobject]$Entry)
+    if (-not $Entry -or -not $Entry.pid) { return $false }
+    $proc = Get-Process -Id $Entry.pid -ErrorAction SilentlyContinue
+    if (-not $proc) { return $false }
+    if ($proc.ProcessName -notin @('agy', 'Antigravity', 'pwsh', 'powershell')) { return $false }
+    if ($Entry.started) {
+        try {
+            $procUtc = $proc.StartTime.ToUniversalTime()
+            $entryUtc = ([datetime]$Entry.started).ToUniversalTime()
+            $diff = [Math]::Abs(($procUtc - $entryUtc).TotalSeconds)
+            if ($diff -gt 2) { return $false }
+        } catch { return $false }
+    }
+    return $true
+}
+
+function Get-InstanceRegistryFile {
+    $BASE = Get-BaseDir
+    return "$BASE\.active_instances.json"
+}
+
+function Get-ActiveInstancesRegistry {
+    $regFile = Get-InstanceRegistryFile
+    if (Test-Path $regFile) {
+        try {
+            $data = Get-Content $regFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $pruned = @()
+            if ($data.instances) {
+                foreach ($inst in $data.instances) {
+                    if (Test-InstanceAlive $inst) {
+                        $pruned += $inst
+                    }
+                }
+            }
+            $data.instances = $pruned
+            return $data
+        } catch {}
+    }
+    return [PSCustomObject]@{
+        instances = @()
+        profile_stack = @()
+        active_vault_profile = $null
+    }
+}
+
+function Save-ActiveInstancesRegistry {
+    param([PSCustomObject]$Registry)
+    $regFile = Get-InstanceRegistryFile
+    $BASE = Get-BaseDir
+    if (!(Test-Path $BASE)) {
+        New-Item -ItemType Directory -Force -Path $BASE | Out-Null
+    }
+    $json = $Registry | ConvertTo-Json -Depth 5
+    Set-Content -Path $regFile -Value $json -Encoding UTF8 -Force
+}
+
+function Register-ActiveInstance {
+    param(
+        $PROFILE,
+        [int]$ProcessId,
+        [string]$ProcessType = "app",
+        [System.DateTime]$StartTime
+    )
+    if ($ProcessId -le 0) { return }
+    Invoke-WithVaultMutex {
+        $reg = Get-ActiveInstancesRegistry
+        $startIso = if ($null -ne $StartTime -and $StartTime -ne [System.DateTime]::MinValue) {
+            $StartTime.ToUniversalTime().ToString("o")
+        } else {
+            (Get-Date).ToUniversalTime().ToString("o")
+        }
+        $inst = [PSCustomObject]@{
+            pid = $ProcessId
+            profile = $PROFILE
+            type = $ProcessType
+            started = $startIso
+        }
+        $reg.instances = @($reg.instances | Where-Object { $_.pid -ne $ProcessId }) + @($inst)
+        Save-ActiveInstancesRegistry $reg
+    }
+}
+
 function Prepare-LaunchCredential {
-    param($PROFILE)
+    param(
+        $PROFILE,
+        [int]$ProcessId = 0,
+        [string]$ProcessType = "cli",
+        [System.DateTime]$StartTime,
+        [switch]$ForceSwitch
+    )
     $BASE = Get-BaseDir
     $credTarget = Get-TargetCredName
     $profileDir = "$BASE\$PROFILE"
@@ -442,96 +584,181 @@ function Prepare-LaunchCredential {
         New-Item -ItemType Directory -Force -Path $BASE | Out-Null
     }
 
-    # Maintain environment variable call stack for clean nested re-entrancy
-    $currentActive = if ($env:MULTIGRAVITY_ACTIVE_PROFILE) { $env:MULTIGRAVITY_ACTIVE_PROFILE } else { (Get-GlobalProfile) }
-    if ($currentActive -and $currentActive -ne $PROFILE) {
-        $stack = if ($env:MULTIGRAVITY_PROFILE_STACK) { $env:MULTIGRAVITY_PROFILE_STACK } else { "" }
-        $env:MULTIGRAVITY_PROFILE_STACK = if ($stack) { "$stack;$currentActive" } else { $currentActive }
-    }
-    $env:MULTIGRAVITY_ACTIVE_PROFILE = $PROFILE
-    Set-Content -Path "$BASE\.active_profile" -Value $PROFILE -Encoding UTF8
+    $hadSavedCredResult = Invoke-WithVaultMutex {
+        $reg = Get-ActiveInstancesRegistry
 
-    $hadSavedCred = $false
-    if (Test-CredentialFileValid $credPath) {
-        try {
-            $json = Get-Content $credPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            if (![string]::IsNullOrWhiteSpace($json.blob)) {
-                $importOk = [MultigravityCredVault]::ImportCredential($credTarget, $json.userName, $json.blob)
-                if ($importOk) {
-                    Write-Host "Restored credential vault for profile '$PROFILE'"
-                    $hadSavedCred = $true
+        # Check for collision with running instances of a DIFFERENT profile
+        $activeOther = @($reg.instances | Where-Object { $_.profile -ne $PROFILE })
+        if ($activeOther.Count -gt 0 -and -not $ForceSwitch) {
+            $otherProfiles = ($activeOther | Select-Object -ExpandProperty profile -Unique) -join ', '
+            $otherPids = ($activeOther | Select-Object -ExpandProperty pid) -join ', '
+            Write-Error "Error: Profile '$otherProfiles' (PID(s): $otherPids) is currently running. Concurrently running distinct profiles is restricted to prevent token collision on Windows Credential Manager ('$credTarget'). Pass --force-switch to proceed."
+            Exit-Multigravity 1
+        }
+
+        # Check if this profile is already the active vault profile
+        $alreadyActive = ($reg.active_vault_profile -and $reg.active_vault_profile -eq $PROFILE)
+        $hadCred = $false
+
+        if (-not $alreadyActive) {
+            # Maintain environment variable call stack for clean nested re-entrancy
+            $currentActive = if ($env:MULTIGRAVITY_ACTIVE_PROFILE) { $env:MULTIGRAVITY_ACTIVE_PROFILE } else { (Get-GlobalProfile) }
+            if ($currentActive -and $currentActive -ne $PROFILE) {
+                $stackEnv = if ($env:MULTIGRAVITY_PROFILE_STACK) { $env:MULTIGRAVITY_PROFILE_STACK } else { "" }
+                $env:MULTIGRAVITY_PROFILE_STACK = if ($stackEnv) { "$stackEnv;$currentActive" } else { $currentActive }
+            }
+
+            if (Test-CredentialFileValid $credPath) {
+                try {
+                    $json = Get-Content $credPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    if (![string]::IsNullOrWhiteSpace($json.blob)) {
+                        $importOk = [MultigravityCredVault]::ImportCredential($credTarget, $json.userName, $json.blob)
+                        if ($importOk) {
+                            Write-Host "Restored credential vault for profile '$PROFILE'"
+                            $hadCred = $true
+                        }
+                    }
+                } catch {
+                    Write-Host "Warning: Could not parse stored credential for profile '$PROFILE'"
                 }
             }
-        } catch {
-            Write-Host "Warning: Could not parse stored credential for profile '$PROFILE'"
+
+            if (!$hadCred) {
+                [MultigravityCredVault]::RemoveCredential($credTarget) | Out-Null
+                Write-Host "Profile '$PROFILE' starting with fresh credential state (login required)."
+            }
+
+            $reg.active_vault_profile = $PROFILE
+        } else {
+            $hadCred = (Test-CredentialFileValid $credPath)
         }
+
+        # Update displacement stack
+        $stackList = [System.Collections.Generic.List[string]]::new()
+        if ($reg.profile_stack) {
+            foreach ($item in $reg.profile_stack) {
+                if ($item -ne $PROFILE) { $stackList.Add($item) }
+            }
+        }
+        $stackList.Add($PROFILE)
+        $reg.profile_stack = @($stackList)
+
+        # Register instance if PID was provided
+        if ($ProcessId -gt 0) {
+            $startIso = if ($null -ne $StartTime -and $StartTime -ne [System.DateTime]::MinValue) {
+                $StartTime.ToUniversalTime().ToString("o")
+            } else {
+                (Get-Date).ToUniversalTime().ToString("o")
+            }
+            $inst = [PSObject]@{
+                pid = $ProcessId
+                profile = $PROFILE
+                type = $ProcessType
+                started = $startIso
+            }
+            $reg.instances = @($reg.instances | Where-Object { $_.pid -ne $ProcessId }) + @($inst)
+        }
+
+        Set-Content -Path "$BASE\.active_profile" -Value $PROFILE -Encoding UTF8
+        $env:MULTIGRAVITY_ACTIVE_PROFILE = $PROFILE
+        Save-ActiveInstancesRegistry $reg
+
+        return [bool]$hadCred
     }
 
-    if (!$hadSavedCred) {
-        [MultigravityCredVault]::RemoveCredential($credTarget) | Out-Null
-        Write-Host "Profile '$PROFILE' starting with fresh credential state (login required)."
-    }
-
-    return $hadSavedCred
+    return [bool]$hadSavedCredResult
 }
 
 function Restore-PostLaunchCredential {
-    param($PROFILE, [bool]$HadSavedCred)
+    param(
+        $PROFILE,
+        [bool]$HadSavedCred,
+        [int]$ProcessId = 0
+    )
     $BASE = Get-BaseDir
     $credTarget = Get-TargetCredName
     $globalProfile = Get-GlobalProfile
     $isGlobal = ($globalProfile -and $globalProfile -eq $PROFILE)
 
-    if ($isGlobal) {
-        if (!$HadSavedCred -and !(Test-ProfileHasValidCredential $PROFILE)) {
-            Save-GlobalCredential $PROFILE | Out-Null
-        } else {
-            Write-Host "Global profile '$PROFILE' credential file is valid; skipping resave on exit."
-        }
-    } else {
-        $credPath = "$BASE\$PROFILE\.credentials.json"
-        if (!$HadSavedCred -and !(Test-ProfileHasValidCredential $PROFILE)) {
-            # Only save initial credential if the profile did not have valid credentials before
-            $user = $null
-            $blob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$user)
-            if ($blob) {
-                $data = @{
-                    userName = $user
-                    blob     = $blob
-                    updated  = (Get-Date).ToString("o")
-                } | ConvertTo-Json
-                Set-Content -Path $credPath -Value $data -Encoding UTF8
-                Write-Host "Saved initial credential for profile '$PROFILE'"
-            }
-        } else {
-            Write-Host "Profile '$PROFILE' credential file is valid; skipping resave on exit."
+    Invoke-WithVaultMutex {
+        $reg = Get-ActiveInstancesRegistry
+
+        # 1. Remove this instance from registry
+        if ($ProcessId -gt 0) {
+            $reg.instances = @($reg.instances | Where-Object { $_.pid -ne $ProcessId })
         }
 
-        # 2. Re-entrant restoration: Pop parent profile from environment stack if nested, otherwise global
-        if ($env:MULTIGRAVITY_PROFILE_STACK) {
-            $stackItems = $env:MULTIGRAVITY_PROFILE_STACK -split ';'
-            $parentProfile = $stackItems[-1]
-            $remainingStack = if ($stackItems.Length -gt 1) { ($stackItems[0..($stackItems.Length - 2)]) -join ';' } else { $null }
-            $env:MULTIGRAVITY_PROFILE_STACK = $remainingStack
-            $env:MULTIGRAVITY_ACTIVE_PROFILE = $parentProfile
-
-            if ($parentProfile -and (Test-Path "$BASE\$parentProfile\.credentials.json")) {
-                try {
-                    $pJson = Get-Content "$BASE\$parentProfile\.credentials.json" -Raw | ConvertFrom-Json
-                    if ($pJson.blob) {
-                        [MultigravityCredVault]::ImportCredential($credTarget, $pJson.userName, $pJson.blob) | Out-Null
-                        Write-Host "Restored parent credential vault for profile '$parentProfile'"
+        # 2. Vault Ownership Verification on Exit:
+        # Only save credentials back if active_vault_profile matches PROFILE
+        if ($reg.active_vault_profile -eq $PROFILE) {
+            if ($isGlobal) {
+                if (!$HadSavedCred -and !(Test-ProfileHasValidCredential $PROFILE)) {
+                    Save-GlobalCredential $PROFILE | Out-Null
+                } else {
+                    Write-Host "Global profile '$PROFILE' credential file is valid; skipping resave on exit."
+                }
+            } else {
+                $credPath = "$BASE\$PROFILE\.credentials.json"
+                if (!$HadSavedCred -and !(Test-ProfileHasValidCredential $PROFILE)) {
+                    $user = $null
+                    $blob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$user)
+                    if ($blob) {
+                        $data = @{
+                            userName = $user
+                            blob     = $blob
+                            updated  = (Get-Date).ToString("o")
+                        } | ConvertTo-Json
+                        Set-Content -Path $credPath -Value $data -Encoding UTF8
+                        Write-Host "Saved initial credential for profile '$PROFILE'"
                     }
-                } catch {}
-            } elseif ($parentProfile -and $parentProfile -eq (Get-GlobalProfile)) {
-                Restore-GlobalCredential
+                } else {
+                    Write-Host "Profile '$PROFILE' credential file is valid; skipping resave on exit."
+                }
             }
-            Set-Content -Path "$BASE\.active_profile" -Value $parentProfile -Encoding UTF8
         } else {
+            Write-Host "Profile '$PROFILE' was displaced by '$($reg.active_vault_profile)'; skipping credential save on exit."
+        }
+
+        # 3. Stack Restoration:
+        # Check if other instances of PROFILE are still running
+        $remainingProfileInstances = @($reg.instances | Where-Object { $_.profile -eq $PROFILE })
+        if ($remainingProfileInstances.Count -eq 0) {
+            $reg.profile_stack = @($reg.profile_stack | Where-Object { $_ -ne $PROFILE })
+        }
+
+        # Check remaining profile_stack
+        if ($reg.profile_stack -and $reg.profile_stack.Count -gt 0) {
+            $parentProfile = $reg.profile_stack[-1]
+            if ($env:MULTIGRAVITY_PROFILE_STACK) {
+                $stackItems = @($env:MULTIGRAVITY_PROFILE_STACK -split ';' | Where-Object { $_ -ne "" })
+                $remainingStack = if ($stackItems.Count -gt 1) { ($stackItems[0..($stackItems.Count - 2)]) -join ';' } else { $null }
+                $env:MULTIGRAVITY_PROFILE_STACK = $remainingStack
+            }
+            if ($reg.active_vault_profile -ne $parentProfile) {
+                if ($parentProfile -and (Test-Path "$BASE\$parentProfile\.credentials.json")) {
+                    try {
+                        $pJson = Get-Content "$BASE\$parentProfile\.credentials.json" -Raw | ConvertFrom-Json
+                        if ($pJson.blob) {
+                            [MultigravityCredVault]::ImportCredential($credTarget, $pJson.userName, $pJson.blob) | Out-Null
+                            Write-Host "Restored parent credential vault for profile '$parentProfile'"
+                        }
+                    } catch {}
+                } elseif ($parentProfile -and $parentProfile -eq $globalProfile) {
+                    Restore-GlobalCredential
+                }
+                $reg.active_vault_profile = $parentProfile
+                Set-Content -Path "$BASE\.active_profile" -Value $parentProfile -Encoding UTF8
+                $env:MULTIGRAVITY_ACTIVE_PROFILE = $parentProfile
+            }
+        } else {
+            # Zero active instances remain across all profiles
             $env:MULTIGRAVITY_ACTIVE_PROFILE = $null
             $env:MULTIGRAVITY_PROFILE_STACK = $null
+            $reg.active_vault_profile = $null
             Restore-GlobalCredential
         }
+
+        Save-ActiveInstancesRegistry $reg
     }
 }
 
@@ -615,11 +842,11 @@ function Validate-Name {
     param($name)
     if ([string]::IsNullOrWhiteSpace($name)) {
         Write-Error "Error: profile name required"
-        exit 1
+        Exit-Multigravity 1
     }
     if ($name -notmatch "^[a-zA-Z0-9][a-zA-Z0-9-]*$") {
         Write-Error "Error: profile name must start with alphanumeric and contain only letters, numbers, or hyphens"
-        exit 1
+        Exit-Multigravity 1
     }
 }
 
@@ -828,84 +1055,83 @@ function Invoke-LaunchProfile {
 
     if ([string]::IsNullOrEmpty($APP) -or !(Test-Path $APP)) {
         Write-Error "Error: Antigravity Desktop App not found"
-        exit 1
+        Exit-Multigravity 1
     }
 
     $gProf = Get-GlobalProfile
     $isGlobal = ($gProf -and $gProf -eq $PROFILE)
     $isShared = Test-SharedProfile $PROFILE
-
-    if ($isGlobal) {
-        Write-Host "Launching Antigravity Desktop App for global profile '$PROFILE'"
-        $hadGlobalCred = Test-CredentialFileValid "$BASE\.global_credentials.json"
-        Restore-GlobalCredential
-        try {
-            $launchArgs = if ($ArgsToForward) {
-                $ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" }
-            } else { @() }
-            if ($launchArgs) {
-                Start-Process -FilePath $APP -ArgumentList $launchArgs -Wait
-            } else {
-                Start-Process -FilePath $APP -Wait
-            }
-        } finally {
-            if (!$hadGlobalCred) {
-                Save-GlobalCredential $PROFILE | Out-Null
-            } else {
-                Write-Host "Global profile '$PROFILE' credential file is valid; skipping resave on exit."
-            }
-        }
-        return
-    }
+    $forceSwitch = ($ArgsToForward -contains "--force-switch" -or $ArgsToForward -contains "--displace")
 
     $PROFILE_DIR = "$BASE\$PROFILE"
-    if (!(Test-Path $PROFILE_DIR)) {
+    if (!$isGlobal -and !(Test-Path $PROFILE_DIR)) {
         Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
-        exit 1
+        Exit-Multigravity 1
     }
 
-    Write-Host "Launching Antigravity Desktop App for profile '$PROFILE'"
-    
+    $cleanForward = if ($ArgsToForward) {
+        @($ArgsToForward | Where-Object {
+            $_ -ne "--global" -and
+            $_ -ne "--save" -and
+            $_ -ne "--save_credential" -and
+            $_ -ne "--save-credential" -and
+            $_ -ne "--save_credentials" -and
+            $_ -ne "--remove_credentials" -and
+            $_ -ne "--remove-credentials" -and
+            $_ -ne "--remove-credential" -and
+            $_ -ne "--force-switch" -and
+            $_ -ne "--displace"
+        })
+    } else { @() }
+
+    $targetName = if ($isGlobal) { "global profile '$PROFILE'" } else { "profile '$PROFILE'" }
+    Write-Host "Launching Antigravity Desktop App for $targetName"
+
     if ($isShared) {
         Sync-SharedProfile $PROFILE
     }
 
-    $hadSavedCred = Prepare-LaunchCredential $PROFILE
+    $hadSavedCred = Prepare-LaunchCredential -PROFILE $PROFILE -ForceSwitch:$forceSwitch
+    $desktopProcess = $null
 
     $oldUserProfile  = $env:USERPROFILE
     $oldAppData      = $env:APPDATA
     $oldLocalAppData = $env:LOCALAPPDATA
 
     try {
-        $userDataDir = "$PROFILE_DIR\AppData\Roaming\Antigravity"
-        $extDir = "$PROFILE_DIR\.antigravity\extensions"
+        $userDataDir = if ($isGlobal) { "$ROOT_USERPROFILE\AppData\Roaming\Antigravity" } else { "$PROFILE_DIR\AppData\Roaming\Antigravity" }
+        $extDir = if ($isGlobal) { "$ROOT_USERPROFILE\.antigravity\extensions" } else { "$PROFILE_DIR\.antigravity\extensions" }
 
         $launchArgs = @(
             "--user-data-dir", $userDataDir,
             "--extensions-dir", $extDir,
             "--password-store=basic"
         )
-
-        if ($ArgsToForward) {
-            $launchArgs += ($ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" })
+        if ($cleanForward) {
+            $launchArgs += $cleanForward
         }
 
         # For shared profiles, run in native Windows user environment so internal terminals have full host access
-        if (!$isShared) {
+        if (!$isShared -and !$isGlobal) {
             $env:USERPROFILE  = $PROFILE_DIR
             $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
             $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
         }
 
-        Start-Process -FilePath $APP -ArgumentList $launchArgs -Wait
+        $desktopProcess = Start-Process -FilePath $APP -ArgumentList $launchArgs -PassThru
+        if ($desktopProcess) {
+            Register-ActiveInstance -PROFILE $PROFILE -ProcessId $desktopProcess.Id -ProcessType "app" -StartTime $desktopProcess.StartTime
+            $desktopProcess.WaitForExit()
+        }
     } finally {
-        if (!$isShared) {
+        if (!$isShared -and !$isGlobal) {
             $env:USERPROFILE  = $oldUserProfile
             $env:APPDATA      = $oldAppData
             $env:LOCALAPPDATA = $oldLocalAppData
         }
 
-        Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred
+        $childPid = if ($desktopProcess) { $desktopProcess.Id } else { 0 }
+        Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred -ProcessId $childPid
     }
 }
 
@@ -918,97 +1144,95 @@ function Invoke-LaunchCLIProfile {
 
     if ([string]::IsNullOrEmpty($CLI_APP) -or !(Test-Path $CLI_APP)) {
         Write-Error "Error: Antigravity CLI (agy) not found"
-        exit 1
+        Exit-Multigravity 1
     }
 
     $gProf = Get-GlobalProfile
     $isGlobal = ($gProf -and $gProf -eq $PROFILE)
     $isShared = Test-SharedProfile $PROFILE
-
-    if ($isGlobal) {
-        Write-Host "Launching Antigravity CLI for global profile '$PROFILE'"
-        $hadGlobalCred = Test-CredentialFileValid "$BASE\.global_credentials.json"
-        Restore-GlobalCredential
-        try {
-            $cleanForwardArgs = if ($ArgsToForward) {
-                $ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" }
-            } else { $null }
-
-            if ($cleanForwardArgs) {
-                & $CLI_APP @cleanForwardArgs
-            } else {
-                & $CLI_APP
-            }
-        } finally {
-            if (!$hadGlobalCred) {
-                Save-GlobalCredential $PROFILE | Out-Null
-            } else {
-                Write-Host "Global profile '$PROFILE' credential file is valid; skipping resave on exit."
-            }
-        }
-        return
-    }
+    $forceSwitch = ($ArgsToForward -contains "--force-switch" -or $ArgsToForward -contains "--displace")
 
     $PROFILE_DIR = "$BASE\$PROFILE"
-    if (!(Test-Path $PROFILE_DIR)) {
+    if (!$isGlobal -and !(Test-Path $PROFILE_DIR)) {
         Write-Error "Error: profile '$PROFILE' does not exist. Run: multigravity new $PROFILE"
-        exit 1
+        Exit-Multigravity 1
     }
 
-    Write-Host "Launching Antigravity CLI for profile '$PROFILE'"
-    
+    $targetName = if ($isGlobal) { "global profile '$PROFILE'" } else { "profile '$PROFILE'" }
+    Write-Host "Launching Antigravity CLI for $targetName"
+
     if ($isShared) {
         Sync-SharedProfile $PROFILE
     }
 
     $cleanForwardArgs = if ($ArgsToForward) {
-        $ArgsToForward | Where-Object { $_ -ne "--global" -and $_ -ne "--save" -and $_ -ne "--remove_credentials" -and $_ -ne "--remove-credentials" -and $_ -ne "--remove-credential" }
-    } else { $null }
-
-    # Mutex synchronization for credential vault swapping across processes
-    $vaultMutex = $null
-    $hasMutexLock = $false
-    try {
-        $vaultMutex = New-Object System.Threading.Mutex($false, "Global\Multigravity_Vault_Mutex")
-        $hasMutexLock = $vaultMutex.WaitOne(30000) # 30s timeout
-    } catch {}
-
-    try {
-        $hadSavedCred = Prepare-LaunchCredential $PROFILE
-
-        $oldUserProfile  = $env:USERPROFILE
-        $oldAppData      = $env:APPDATA
-        $oldLocalAppData = $env:LOCALAPPDATA
-
-        try {
-            # For shared profiles, run in native Windows user environment (USERPROFILE, APPDATA, LOCALAPPDATA intact)
-            if (!$isShared) {
-                $env:USERPROFILE  = $PROFILE_DIR
-                $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
-                $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
+        $filtered = @($ArgsToForward | Where-Object {
+            $_ -ne "--global" -and
+            $_ -ne "--save" -and
+            $_ -ne "--save_credential" -and
+            $_ -ne "--save-credential" -and
+            $_ -ne "--save_credentials" -and
+            $_ -ne "--remove_credentials" -and
+            $_ -ne "--remove-credentials" -and
+            $_ -ne "--remove-credential" -and
+            $_ -ne "--force-switch" -and
+            $_ -ne "--displace"
+        })
+        if ($pipelineBuffer -and $pipelineBuffer.Count -gt 0) {
+            $res = [System.Collections.Generic.List[string]]::new()
+            $skipNext = $false
+            for ($i = 0; $i -lt $filtered.Count; $i++) {
+                if ($skipNext) { $skipNext = $false; continue }
+                if (($filtered[$i] -in @("-p", "--print", "--prompt")) -and ($i + 1 -lt $filtered.Count) -and ($filtered[$i + 1] -eq "-")) {
+                    $skipNext = $true
+                    continue
+                }
+                if ($filtered[$i] -match '^(-p|--print|--prompt)=-$') {
+                    continue
+                }
+                $res.Add($filtered[$i])
             }
-
-            if ($cleanForwardArgs) {
-                & $CLI_APP @cleanForwardArgs
-            } else {
-                & $CLI_APP
-            }
-        } finally {
-            if (!$isShared) {
-                $env:USERPROFILE  = $oldUserProfile
-                $env:APPDATA      = $oldAppData
-                $env:LOCALAPPDATA = $oldLocalAppData
-            }
-
-            Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred
+            @($res)
+        } else {
+            $filtered
         }
+    } else { @() }
+
+    $currentProc = [System.Diagnostics.Process]::GetCurrentProcess()
+    $hadSavedCred = Prepare-LaunchCredential -PROFILE $PROFILE -ProcessId $currentProc.Id -ProcessType "cli" -StartTime $currentProc.StartTime -ForceSwitch:$forceSwitch
+
+    $oldUserProfile  = $env:USERPROFILE
+    $oldAppData      = $env:APPDATA
+    $oldLocalAppData = $env:LOCALAPPDATA
+    $cliExitCode = 0
+
+    try {
+        # For shared profiles, run in native Windows user environment (USERPROFILE, APPDATA, LOCALAPPDATA intact)
+        if (!$isShared -and !$isGlobal) {
+            $env:USERPROFILE  = $PROFILE_DIR
+            $env:APPDATA      = "$PROFILE_DIR\AppData\Roaming"
+            $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
+        }
+
+        if ($pipelineBuffer -and $pipelineBuffer.Count -gt 0) {
+            $pipelineBuffer | & $CLI_APP @cleanForwardArgs
+        } else {
+            & $CLI_APP @cleanForwardArgs
+        }
+        $cliExitCode = $LASTEXITCODE
     } finally {
-        if ($vaultMutex -and $hasMutexLock) {
-            try { $vaultMutex.ReleaseMutex() } catch {}
+        if (!$isShared -and !$isGlobal) {
+            $env:USERPROFILE  = $oldUserProfile
+            $env:APPDATA      = $oldAppData
+            $env:LOCALAPPDATA = $oldLocalAppData
         }
-        if ($vaultMutex) {
-            try { $vaultMutex.Dispose() } catch {}
-        }
+
+        Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred -ProcessId $currentProc.Id
+    }
+
+    if ($null -ne $cliExitCode) {
+        $global:LASTEXITCODE = $cliExitCode
+        Exit-Multigravity $cliExitCode
     }
 }
 
@@ -1086,7 +1310,7 @@ function Invoke-NewProfile {
 
     if ([string]::IsNullOrWhiteSpace($name)) {
         Write-Error "Error: profile name required"
-        exit 1
+        Exit-Multigravity 1
     }
 
     Validate-Name $name
@@ -1094,7 +1318,7 @@ function Invoke-NewProfile {
     $profileDir = "$BASE\$name"
     if (Test-Path $profileDir) {
         Write-Error "Error: profile '$name' already exists"
-        exit 1
+        Exit-Multigravity 1
     }
 
     New-Item -ItemType Directory -Force -Path $BASE | Out-Null
@@ -1103,7 +1327,7 @@ function Invoke-NewProfile {
         $tplPath = "$(Get-TemplatesDir)\$fromTpl"
         if (!(Test-Path $tplPath)) {
             Write-Error "Error: template '$fromTpl' not found. Run: multigravity template list"
-            exit 1
+            Exit-Multigravity 1
         }
         Write-Host "Creating profile '$name' from template '$fromTpl'..."
         Copy-Item -Path $tplPath -Destination $profileDir -Recurse
@@ -1131,7 +1355,7 @@ function Invoke-DeleteProfile {
     $PROFILE_DIR = "$BASE\$PROFILE"
     if (!(Test-Path $PROFILE_DIR)) {
         Write-Error "Error: profile '$PROFILE' does not exist"
-        exit 1
+        Exit-Multigravity 1
     }
 
     $confirm = Read-Host "Delete profile '$PROFILE' and all its data? [y/N]"
@@ -1171,11 +1395,11 @@ function Invoke-RenameProfile {
 
     if (!(Test-Path $OLD_DIR)) {
         Write-Error "Error: profile '$OLD' does not exist"
-        exit 1
+        Exit-Multigravity 1
     }
     if (Test-Path $NEW_DIR) {
         Write-Error "Error: profile '$NEW' already exists"
-        exit 1
+        Exit-Multigravity 1
     }
 
     Rename-Item -Path $OLD_DIR -NewName $NEW
@@ -1204,11 +1428,11 @@ function Invoke-CloneProfile {
 
     if (!(Test-Path $SRC_DIR)) {
         Write-Error "Error: source profile '$SRC' does not exist"
-        exit 1
+        Exit-Multigravity 1
     }
     if (Test-Path $DEST_DIR) {
         Write-Error "Error: destination profile '$DEST' already exists"
-        exit 1
+        Exit-Multigravity 1
     }
 
     Write-Host "Cloning profile '$SRC' to '$DEST'..."
@@ -1418,7 +1642,7 @@ function Invoke-UpdateCli {
 
     if ([string]::IsNullOrEmpty($target)) {
         Write-Error "Error: could not determine script path for update"
-        exit 1
+        Exit-Multigravity 1
     }
 
     Write-Host "Updating multigravity from $script_url ..."
@@ -1426,13 +1650,13 @@ function Invoke-UpdateCli {
         $result = Invoke-WebRequest -Uri $script_url -UseBasicParsing -ErrorAction Stop
         if ([string]::IsNullOrWhiteSpace($result.Content) -or $result.Content.Length -lt 500) {
             Write-Error "Error: downloaded update payload is invalid or empty"
-            exit 1
+            Exit-Multigravity 1
         }
         [System.IO.File]::WriteAllText($target, $result.Content, [System.Text.Encoding]::UTF8)
         Write-Host "Successfully updated multigravity!"
     } catch {
         Write-Error "Error: failed to download update: $_"
-        exit 1
+        Exit-Multigravity 1
     }
 }
 
@@ -1467,14 +1691,14 @@ function Invoke-TemplateCmd {
     switch ($sub) {
         "save" {
             if ([string]::IsNullOrWhiteSpace($a) -or [string]::IsNullOrWhiteSpace($b)) {
-                Write-Error "Error: usage: multigravity template save <profile> <name>"; exit 1
+                Write-Error "Error: usage: multigravity template save <profile> <name>"; Exit-Multigravity 1
             }
             Validate-Name $a; Validate-Name $b
             $srcDir  = "$BASE\$a"
             $tplDir  = Get-TemplatesDir
             $tplPath = "$tplDir\$b"
-            if (!(Test-Path $srcDir))  { Write-Error "Error: profile '$a' does not exist"; exit 1 }
-            if (Test-Path $tplPath)    { Write-Error "Error: template '$b' already exists"; exit 1 }
+            if (!(Test-Path $srcDir))  { Write-Error "Error: profile '$a' does not exist"; Exit-Multigravity 1 }
+            if (Test-Path $tplPath)    { Write-Error "Error: template '$b' already exists"; Exit-Multigravity 1 }
             New-Item -ItemType Directory -Force -Path $tplDir | Out-Null
             Write-Host "Saving '$a' as template '$b'..."
             Copy-Item -Path $srcDir -Destination $tplPath -Recurse
@@ -1493,15 +1717,15 @@ function Invoke-TemplateCmd {
             }
         }
         "delete" {
-            if ([string]::IsNullOrWhiteSpace($a)) { Write-Error "Error: template name required"; exit 1 }
+            if ([string]::IsNullOrWhiteSpace($a)) { Write-Error "Error: template name required"; Exit-Multigravity 1 }
             Validate-Name $a
             $tplPath = "$(Get-TemplatesDir)\$a"
-            if (!(Test-Path $tplPath)) { Write-Error "Error: template '$a' does not exist"; exit 1 }
+            if (!(Test-Path $tplPath)) { Write-Error "Error: template '$a' does not exist"; Exit-Multigravity 1 }
             Remove-Item -Recurse -Force $tplPath
             Write-Host "Deleted template '$a'"
         }
         default {
-            Write-Error "Error: usage: multigravity template <save|list|delete>"; exit 1
+            Write-Error "Error: usage: multigravity template <save|list|delete>"; Exit-Multigravity 1
         }
     }
 }
@@ -1546,11 +1770,11 @@ function Invoke-StatusProfiles {
 
 function Invoke-ExportProfile {
     param($name, $outPath)
-    if ([string]::IsNullOrWhiteSpace($name)) { Write-Error "Error: profile name required"; exit 1 }
+    if ([string]::IsNullOrWhiteSpace($name)) { Write-Error "Error: profile name required"; Exit-Multigravity 1 }
     Validate-Name $name
 
     $profileDir = "$BASE\$name"
-    if (!(Test-Path $profileDir)) { Write-Error "Error: profile '$name' does not exist"; exit 1 }
+    if (!(Test-Path $profileDir)) { Write-Error "Error: profile '$name' does not exist"; Exit-Multigravity 1 }
 
     if ([string]::IsNullOrWhiteSpace($outPath)) { $outPath = ".\$name.zip" }
 
@@ -1563,10 +1787,10 @@ function Invoke-ImportProfile {
     param($archivePath, $name, [string[]]$extraArgs)
 
     if ([string]::IsNullOrWhiteSpace($archivePath)) {
-        Write-Error "Error: usage: multigravity import <archive.zip> [name]"; exit 1
+        Write-Error "Error: usage: multigravity import <archive.zip> [name]"; Exit-Multigravity 1
     }
     if (!(Test-Path $archivePath)) {
-        Write-Error "Error: file not found: $archivePath"; exit 1
+        Write-Error "Error: file not found: $archivePath"; Exit-Multigravity 1
     }
 
     if ([string]::IsNullOrWhiteSpace($name)) {
@@ -1577,7 +1801,7 @@ function Invoke-ImportProfile {
     $dest = "$BASE\$name"
     if (Test-Path $dest) {
         Write-Error "Error: profile '$name' already exists - choose a different name or delete it first"
-        exit 1
+        Exit-Multigravity 1
     }
 
     New-Item -ItemType Directory -Force -Path $BASE | Out-Null
@@ -1604,132 +1828,157 @@ function Invoke-ImportProfile {
     }
     Write-Host "Imported profile '$name'"
 }
+} # end begin
 
-switch ($cmd) {
-    "new" {
-        $extra = @()
-        if ($arg2)       { $extra += $arg2 }
-        if ($ForwardArgs) { $extra += $ForwardArgs }
-        Invoke-NewProfile $arg1 $extra
-    }
-    "global" {
-        $sub = $arg1
-        if ($sub -eq "save_credential" -or $sub -eq "save-credential" -or $sub -eq "save" -or $sub -eq "--save_credential" -or $sub -eq "--save-credential" -or $sub -eq "--save") {
-            $prof = if ($arg2) { $arg2 } else { Get-GlobalProfile }
-            Save-GlobalCredential $prof | Out-Null
-        } elseif ($sub -eq "remove_credentials" -or $sub -eq "remove-credentials" -or $sub -eq "--remove_credentials" -or $sub -eq "--remove-credentials" -or $sub -eq "remove" -or $sub -eq "--remove") {
-            Remove-GlobalCredential
-        } elseif ($sub -eq "unset" -or $sub -eq "clear" -or $sub -eq "--unset") {
-            Unset-GlobalProfile
-        } elseif ([string]::IsNullOrWhiteSpace($sub)) {
-            $g = Get-GlobalProfile
-            if ($g) {
-                Write-Host "Current global profile: $g"
-            } else {
-                Write-Host "No global profile currently set. Set one with: multigravity global <profile-name>"
+process {
+    if ($null -ne $InputObject) {
+        if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+            foreach ($item in $InputObject) {
+                if ($null -ne $item) { $pipelineBuffer.Add([string]$item) }
             }
         } else {
-            Set-GlobalProfile $sub
-        }
-    }
-    "list" {
-        Invoke-ListProfiles
-    }
-    "status" {
-        Invoke-StatusProfiles
-    }
-    "rename" {
-        Invoke-RenameProfile $arg1 $arg2
-    }
-    "delete" {
-        Invoke-DeleteProfile $arg1
-    }
-    "clone" {
-        $extra = @()
-        if ($ForwardArgs) { $extra += $ForwardArgs }
-        Invoke-CloneProfile $arg1 $arg2 $extra
-    }
-    "template" {
-        Invoke-TemplateCmd $arg1 $arg2 ($ForwardArgs | Select-Object -First 1)
-    }
-    "export" {
-        Invoke-ExportProfile $arg1 $arg2
-    }
-    "import" {
-        $extra = @()
-        if ($ForwardArgs) { $extra += $ForwardArgs }
-        Invoke-ImportProfile $arg1 $arg2 $extra
-    }
-    "update" {
-        Invoke-UpdateCli
-    }
-    "doctor" {
-        Invoke-DoctorCli
-    }
-    "stats" {
-        Invoke-ProfileStats
-    }
-    "shortcuts" {
-        $extra = @()
-        if ($arg2)       { $extra += $arg2 }
-        if ($ForwardArgs) { $extra += $ForwardArgs }
-        Invoke-ShortcutsCmd $arg1 $extra
-    }
-    "shortcut" {
-        $extra = @()
-        if ($arg2)       { $extra += $arg2 }
-        if ($ForwardArgs) { $extra += $ForwardArgs }
-        Invoke-ShortcutsCmd $arg1 $extra
-    }
-    "completion" {
-        if ($arg1) {
-            Invoke-GenerateCompletion $arg1
-        } else {
-            Invoke-HelpCompletion
-        }
-    }
-    "app" {
-        $AllArgs = @()
-        if ($arg2)       { $AllArgs += $arg2 }
-        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
-        Invoke-LaunchProfile $arg1 $AllArgs
-    }
-    "desktop" {
-        $AllArgs = @()
-        if ($arg2)       { $AllArgs += $arg2 }
-        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
-        Invoke-LaunchProfile $arg1 $AllArgs
-    }
-    "cli" {
-        $AllArgs = @()
-        if ($arg2)       { $AllArgs += $arg2 }
-        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
-        Invoke-LaunchCLIProfile $arg1 $AllArgs
-    }
-    "agy" {
-        $AllArgs = @()
-        if ($arg2)       { $AllArgs += $arg2 }
-        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
-        Invoke-LaunchCLIProfile $arg1 $AllArgs
-    }
-    "help"   { Write-Usage }
-    "--help" { Write-Usage }
-    "-h"     { Write-Usage }
-    "" {
-        Write-Usage
-        exit 1
-    }
-    default {
-        $AllArgs = @()
-        if ($arg1)       { $AllArgs += $arg1 }
-        if ($arg2)       { $AllArgs += $arg2 }
-        if ($ForwardArgs) { $AllArgs += $ForwardArgs }
-
-        if ($AllArgs -contains "--cli" -or $AllArgs -contains "--agy") {
-            $filteredArgs = $AllArgs | Where-Object { $_ -ne "--cli" -and $_ -ne "--agy" }
-            Invoke-LaunchCLIProfile $cmd $filteredArgs
-        } else {
-            Invoke-LaunchProfile $cmd $AllArgs
+            $pipelineBuffer.Add([string]$InputObject)
         }
     }
 }
+
+end {
+try {
+    $rawTokens = [System.Collections.Generic.List[string]]::new()
+    if ($cmd) { $rawTokens.Add($cmd) }
+    if ($AllRawArgs) { $rawTokens.AddRange($AllRawArgs) }
+    if ($PSBoundParameters.ContainsKey('p')) {
+        $rawTokens.Add("-p")
+        $rawTokens.Add($p)
+    }
+
+    if ($rawTokens.Count -eq 0) {
+        Write-Usage
+        Exit-Multigravity 1
+    }
+
+    $firstToken = $rawTokens[0]
+    $forward = if ($rawTokens.Count -ge 2) { @($rawTokens | Select-Object -Skip 1) } else { @() }
+    $arg1 = if ($forward.Count -ge 1) { $forward[0] } else { $null }
+    $arg2 = if ($forward.Count -ge 2) { $forward[1] } else { $null }
+    $extra = if ($forward.Count -ge 3) { @($forward | Select-Object -Skip 2) } else { @() }
+    $subForward = if ($forward.Count -ge 1) { @($forward | Select-Object -Skip 1) } else { @() }
+
+    if ($firstToken -in @("help", "--help", "-h", "-?", "/?")) {
+        Write-Usage
+        Exit-Multigravity 0
+    }
+
+    switch ($firstToken) {
+        "new" {
+            $newArgs = @()
+            if ($arg2) { $newArgs += $arg2 }
+            if ($extra) { $newArgs += $extra }
+            Invoke-NewProfile $arg1 $newArgs
+        }
+        "global" {
+            $sub = $arg1
+            if ($sub -eq "save_credential" -or $sub -eq "save-credential" -or $sub -eq "save" -or $sub -eq "--save_credential" -or $sub -eq "--save-credential" -or $sub -eq "--save") {
+                $prof = if ($arg2) { $arg2 } else { Get-GlobalProfile }
+                Save-GlobalCredential $prof | Out-Null
+            } elseif ($sub -eq "remove_credentials" -or $sub -eq "remove-credentials" -or $sub -eq "--remove_credentials" -or $sub -eq "--remove-credentials" -or $sub -eq "remove" -or $sub -eq "--remove") {
+                Remove-GlobalCredential
+            } elseif ($sub -eq "unset" -or $sub -eq "clear" -or $sub -eq "--unset") {
+                Unset-GlobalProfile
+            } elseif ([string]::IsNullOrWhiteSpace($sub)) {
+                $g = Get-GlobalProfile
+                if ($g) {
+                    Write-Host "Current global profile: $g"
+                } else {
+                    Write-Host "No global profile currently set. Set one with: multigravity global <profile-name>"
+                }
+            } else {
+                Set-GlobalProfile $sub
+            }
+        }
+        "list" {
+            Invoke-ListProfiles
+        }
+        "status" {
+            Invoke-StatusProfiles
+        }
+        "rename" {
+            Invoke-RenameProfile $arg1 $arg2
+        }
+        "delete" {
+            Invoke-DeleteProfile $arg1
+        }
+        "clone" {
+            $cloneExtra = @()
+            if ($extra) { $cloneExtra += $extra }
+            Invoke-CloneProfile $arg1 $arg2 $cloneExtra
+        }
+        "template" {
+            $tplArg3 = if ($extra -and $extra.Count -gt 0) { $extra[0] } else { $null }
+            Invoke-TemplateCmd $arg1 $arg2 $tplArg3
+        }
+        "export" {
+            Invoke-ExportProfile $arg1 $arg2
+        }
+        "import" {
+            $importExtra = @()
+            if ($extra) { $importExtra += $extra }
+            Invoke-ImportProfile $arg1 $arg2 $importExtra
+        }
+        "update" {
+            Invoke-UpdateCli
+        }
+        "doctor" {
+            Invoke-DoctorCli
+        }
+        "stats" {
+            Invoke-ProfileStats
+        }
+        "shortcuts" {
+            $shortExtra = @()
+            if ($arg2) { $shortExtra += $arg2 }
+            if ($extra) { $shortExtra += $extra }
+            Invoke-ShortcutsCmd $arg1 $shortExtra
+        }
+        "shortcut" {
+            $shortExtra = @()
+            if ($arg2) { $shortExtra += $arg2 }
+            if ($extra) { $shortExtra += $extra }
+            Invoke-ShortcutsCmd $arg1 $shortExtra
+        }
+        "completion" {
+            if ($arg1) {
+                Invoke-GenerateCompletion $arg1
+            } else {
+                Invoke-HelpCompletion
+            }
+        }
+        "app" {
+            Invoke-LaunchProfile $arg1 $subForward
+        }
+        "desktop" {
+            Invoke-LaunchProfile $arg1 $subForward
+        }
+        "cli" {
+            Invoke-LaunchCLIProfile $arg1 $subForward
+        }
+        "agy" {
+            Invoke-LaunchCLIProfile $arg1 $subForward
+        }
+        default {
+            if ($firstToken.StartsWith("-")) {
+                Write-Error "Error: Unknown option '$firstToken'. Run 'multigravity help' for usage."
+                Exit-Multigravity 1
+            }
+            if ($forward -contains "--cli" -or $forward -contains "--agy") {
+                $filteredArgs = @($forward | Where-Object { $_ -ne "--cli" -and $_ -ne "--agy" })
+                Invoke-LaunchCLIProfile $firstToken $filteredArgs
+            } else {
+                Invoke-LaunchProfile $firstToken $forward
+            }
+        }
+    }
+} catch [MultigravityExitException] {
+    return $_.Exception.ExitCode
+}
+} # end end
