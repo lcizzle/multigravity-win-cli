@@ -87,6 +87,13 @@ exit /b %ERRORLEVEL%
 # Save wrapper as ASCII for widest compatibility with cmd.exe
 [System.IO.File]::WriteAllText("$INSTALL_DIR\multigravity.cmd", $wrapper, [System.Text.Encoding]::ASCII)
 
+Write-Step "Configuring Antigravity lifecycle hooks for conversation tracking..."
+try {
+    & "$INSTALL_DIR\multigravity.cmd" hooks install
+} catch {
+    Write-Host "  Note: You can configure hooks later with: multigravity hooks install"
+}
+
 Write-Host ""
 Write-Host "[OK] Multigravity installed successfully!"
 Write-Host ""
