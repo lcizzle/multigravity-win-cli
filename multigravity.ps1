@@ -560,7 +560,7 @@ try {
         if ($updated) {
             $newJson = $regObj | ConvertTo-Json -Depth 5
             $tmpPath = "$regPath.tmp"
-            [System.IO.File]::WriteAllText($tmpPath, $newJson, [System.Text.Encoding]::UTF8)
+            [System.IO.File]::WriteAllText($tmpPath, $newJson, [System.Text.UTF8Encoding]::new($false))
             Move-Item -Path $tmpPath -Destination $regPath -Force
         }
     } finally {
@@ -622,7 +622,7 @@ function Register-HookInConfigFile {
 
     $newJson = $existing | ConvertTo-Json -Depth 10
     $tmpPath = "$ConfigFilePath.tmp"
-    [System.IO.File]::WriteAllText($tmpPath, $newJson, [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($tmpPath, $newJson, [System.Text.UTF8Encoding]::new($false))
     Move-Item -Path $tmpPath -Destination $ConfigFilePath -Force
     return $true
 }
@@ -649,7 +649,7 @@ function Unregister-HookInConfigFile {
         if ($found) {
             $newJson = $existing | ConvertTo-Json -Depth 10
             $tmpPath = "$ConfigFilePath.tmp"
-            [System.IO.File]::WriteAllText($tmpPath, $newJson, [System.Text.Encoding]::UTF8)
+            [System.IO.File]::WriteAllText($tmpPath, $newJson, [System.Text.UTF8Encoding]::new($false))
             Move-Item -Path $tmpPath -Destination $ConfigFilePath -Force
         }
         return $true
@@ -678,7 +678,7 @@ function Ensure-MultigravityHooks {
 
     # Write hook script and wrapper if missing or forced
     if ($Force -or (-not (Test-Path $hookPs1Path))) {
-        [System.IO.File]::WriteAllText($hookPs1Path, $script:MultigravityHookScriptContent, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($hookPs1Path, $script:MultigravityHookScriptContent, [System.Text.UTF8Encoding]::new($false))
     }
     if ($Force -or (-not (Test-Path $hookCmdPath))) {
         $wrapper = "@echo off`r`nsetlocal`r`nchcp 65001 >nul`r`nwhere.exe pwsh.exe >nul 2>&1`r`nif %ERRORLEVEL% equ 0 (`r`n    pwsh.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"%~dp0multigravity-hook.ps1`" %*`r`n) else (`r`n    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"%~dp0multigravity-hook.ps1`" %*`r`n)`r`nexit /b 0`r`n"
@@ -896,7 +896,7 @@ function Save-ActiveInstancesRegistry {
         New-Item -ItemType Directory -Force -Path $BASE | Out-Null
     }
     $json = $Registry | ConvertTo-Json -Depth 5
-    Set-Content -Path $regFile -Value $json -Encoding UTF8 -Force
+    [System.IO.File]::WriteAllText($regFile, $json, [System.Text.UTF8Encoding]::new($false))
 }
 
 function Get-ActiveInstancesRegistry {
@@ -1084,7 +1084,7 @@ function Set-GlobalProfile {
                         if ($gJson.blob) {
                             [MultigravityCredVault]::ImportCredential($credTarget, $gJson.userName, $gJson.blob) | Out-Null
                             $reg.active_vault_profile = $PROFILE
-                            Set-Content -Path "$BASE\.active_profile" -Value $PROFILE -Encoding UTF8
+                            [System.IO.File]::WriteAllText("$BASE\.active_profile", $PROFILE, [System.Text.UTF8Encoding]::new($false))
                             $env:MULTIGRAVITY_ACTIVE_PROFILE = $null
                         }
                     } catch {}
@@ -1125,7 +1125,7 @@ function Set-GlobalProfile {
                 }
             }
 
-            Set-Content -Path $globalProfFile -Value $PROFILE -Encoding UTF8
+            [System.IO.File]::WriteAllText($globalProfFile, $PROFILE, [System.Text.UTF8Encoding]::new($false))
             Write-Host "Set global profile name to '$PROFILE'"
 
             # If zero instances are running, synchronize Windows Credential Manager and resting ownership
@@ -1137,7 +1137,7 @@ function Set-GlobalProfile {
                         if ($gJson.blob) {
                             [MultigravityCredVault]::ImportCredential($credTarget, $gJson.userName, $gJson.blob) | Out-Null
                             $reg.active_vault_profile = $PROFILE
-                            Set-Content -Path "$BASE\.active_profile" -Value $PROFILE -Encoding UTF8
+                            [System.IO.File]::WriteAllText("$BASE\.active_profile", $PROFILE, [System.Text.UTF8Encoding]::new($false))
                             $env:MULTIGRAVITY_ACTIVE_PROFILE = $null
                         }
                     } catch {}
@@ -1274,7 +1274,7 @@ function Save-GlobalCredential {
             blob     = $blob
             updated  = (Get-Date).ToString("o")
         } | ConvertTo-Json
-        Set-Content -Path $tmpTarget -Value $data -Encoding UTF8
+        [System.IO.File]::WriteAllText($tmpTarget, $data, [System.Text.UTF8Encoding]::new($false))
 
         if (-not (Test-CredentialFileValid $tmpTarget)) {
             Remove-Item $tmpTarget -Force -ErrorAction SilentlyContinue
@@ -1314,7 +1314,7 @@ function Save-GlobalCredential {
 
         # 5. Update .global_profile if PROFILE specified and differs
         if ($PROFILE -and $currentGlobal -ne $PROFILE) {
-            Set-Content -Path "$BASE\.global_profile" -Value $PROFILE -Encoding UTF8
+            [System.IO.File]::WriteAllText("$BASE\.global_profile", $PROFILE, [System.Text.UTF8Encoding]::new($false))
         }
 
         $label = if ($PROFILE) { $PROFILE } elseif ($currentGlobal) { $currentGlobal } else { "global" }
@@ -1371,7 +1371,7 @@ function Save-CredentialToProfile {
                 blob     = $blob
                 updated  = (Get-Date).ToString("o")
             } | ConvertTo-Json
-            Set-Content -Path $tmpTarget -Value $data -Encoding UTF8
+            [System.IO.File]::WriteAllText($tmpTarget, $data, [System.Text.UTF8Encoding]::new($false))
 
             if (Test-CredentialFileValid $tmpTarget) {
                 Move-Item -Path $tmpTarget -Destination $credPath -Force
@@ -1464,7 +1464,7 @@ function Restore-GlobalCredential {
                     $reg.active_vault_profile = $globalProfile
                     Save-ActiveInstancesRegistry $reg
                     if ($globalProfile) {
-                        Set-Content -Path "$BASE\.active_profile" -Value $globalProfile -Encoding UTF8
+                        [System.IO.File]::WriteAllText("$BASE\.active_profile", $globalProfile, [System.Text.UTF8Encoding]::new($false))
                     } else {
                         if (Test-Path "$BASE\.active_profile") {
                             Remove-Item "$BASE\.active_profile" -Force -ErrorAction SilentlyContinue
@@ -1557,7 +1557,7 @@ function Prepare-LaunchCredential {
         $reg.active_vault_profile = $PROFILE
 
         # Update environment and active profile indicator
-        Set-Content -Path "$BASE\.active_profile" -Value $PROFILE -Encoding UTF8
+        [System.IO.File]::WriteAllText("$BASE\.active_profile", $PROFILE, [System.Text.UTF8Encoding]::new($false))
         $env:MULTIGRAVITY_ACTIVE_PROFILE = $PROFILE
         if ($ProcessId -gt 0) {
             $env:MULTIGRAVITY_ACTIVE_PID = $ProcessId
@@ -1638,7 +1638,7 @@ function Restore-PostLaunchCredential {
                         blob     = $blob
                         updated  = (Get-Date).ToString("o")
                     } | ConvertTo-Json
-                    Set-Content -Path $tmpTarget -Value $data -Encoding UTF8
+                    [System.IO.File]::WriteAllText($tmpTarget, $data, [System.Text.UTF8Encoding]::new($false))
                     if (Test-CredentialFileValid $tmpTarget) {
                         Move-Item -Path $tmpTarget -Destination $credPath -Force
                         if (-not $HadSavedCred) {
@@ -1823,7 +1823,7 @@ function New-SharedFileLink {
     }
 
     if (!(Test-Path $src)) {
-        Set-Content -Path $src -Value "{}`n" -Encoding UTF8
+        [System.IO.File]::WriteAllText($src, "{}`n", [System.Text.UTF8Encoding]::new($false))
     }
 
     if (Test-Path $dest) {
@@ -2147,7 +2147,7 @@ function Start-AsyncGlobalRestore {
                                     [System.Console]::WriteLine("Restored global profile credential vault ('$label').")
 
                                     if ($gProfile) {
-                                        [System.IO.File]::WriteAllText($aPath, $gProfile, [System.Text.Encoding]::UTF8)
+                                        [System.IO.File]::WriteAllText($aPath, $gProfile, [System.Text.UTF8Encoding]::new($false))
                                     } else {
                                         if (Test-Path $aPath) { [System.IO.File]::Delete($aPath) }
                                     }
@@ -2155,7 +2155,7 @@ function Start-AsyncGlobalRestore {
                                     $regObj = $raw | ConvertFrom-Json
                                     $regObj.active_vault_profile = $gProfile
                                     $newJson = $regObj | ConvertTo-Json -Depth 5
-                                    [System.IO.File]::WriteAllText($rPath, $newJson, [System.Text.Encoding]::UTF8)
+                                    [System.IO.File]::WriteAllText($rPath, $newJson, [System.Text.UTF8Encoding]::new($false))
                                 }
                             } else {
                                 [MultigravityCredVault]::RemoveCredential($cTarget) | Out-Null
@@ -2164,7 +2164,7 @@ function Start-AsyncGlobalRestore {
                                 $regObj = $raw | ConvertFrom-Json
                                 $regObj.active_vault_profile = $null
                                 $newJson = $regObj | ConvertTo-Json -Depth 5
-                                [System.IO.File]::WriteAllText($rPath, $newJson, [System.Text.Encoding]::UTF8)
+                                [System.IO.File]::WriteAllText($rPath, $newJson, [System.Text.UTF8Encoding]::new($false))
                             }
                         }
                     } catch {}
@@ -2180,6 +2180,19 @@ function Start-AsyncGlobalRestore {
     } catch {
         return $null
     }
+}
+
+function Ensure-MultigravityPromptsDir {
+    $promptsDir = Join-Path (Get-Location) ".agents\tmp\prompts"
+    if (-not (Test-Path $promptsDir)) {
+        try {
+            New-Item -ItemType Directory -Force -Path $promptsDir -ErrorAction Stop | Out-Null
+        } catch {
+            $promptsDir = Join-Path ([System.IO.Path]::GetTempPath()) "multigravity\prompts"
+            New-Item -ItemType Directory -Force -Path $promptsDir -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+    return $promptsDir
 }
 
 function Invoke-LaunchCLIProfile {
@@ -2226,25 +2239,106 @@ function Invoke-LaunchCLIProfile {
             $_ -ne "--force-switch" -and
             $_ -ne "--displace"
         })
+
+        # Handle explicit --prompt-file <path>
+        $promptFileIdx = -1
+        $promptFilePathArg = $null
+        for ($i = 0; $i -lt $filtered.Count; $i++) {
+            if ($filtered[$i] -eq "--prompt-file" -and ($i + 1 -lt $filtered.Count)) {
+                $promptFileIdx = $i
+                $promptFilePathArg = $filtered[$i + 1]
+                break
+            } elseif ($filtered[$i] -match '^--prompt-file=(.+)$') {
+                $promptFileIdx = $i
+                $promptFilePathArg = $Matches[1]
+                break
+            }
+        }
+        if ($promptFilePathArg -and (Test-Path $promptFilePathArg)) {
+            $absSource = (Resolve-Path $promptFilePathArg).Path
+            $promptsDir = Ensure-MultigravityPromptsDir
+            $destFile = if ($absSource.StartsWith($promptsDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $absSource
+            } else {
+                $timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($absSource)
+                $ext = [System.IO.Path]::GetExtension($absSource)
+                $target = Join-Path $promptsDir "${baseName}_${timestamp}${ext}"
+                Copy-Item -Path $absSource -Destination $target -Force
+                $target
+            }
+            $res = [System.Collections.Generic.List[string]]::new()
+            for ($i = 0; $i -lt $filtered.Count; $i++) {
+                if ($i -eq $promptFileIdx) {
+                    if ($filtered[$i] -eq "--prompt-file") { $i++ }
+                    continue
+                }
+                $res.Add($filtered[$i])
+            }
+            $res.Add("-p")
+            $res.Add("Please read the prompt instructions from file '$destFile' and inspect the current directory. Follow all instructions in that file.")
+            $filtered = [string[]]@($res)
+        }
+
         if ($pipelineBuffer -and $pipelineBuffer.Count -gt 0) {
+            $hadPipedArg = $false
             $res = [System.Collections.Generic.List[string]]::new()
             $skipNext = $false
             for ($i = 0; $i -lt $filtered.Count; $i++) {
                 if ($skipNext) { $skipNext = $false; continue }
                 if (($filtered[$i] -in @("-p", "--print", "--prompt")) -and ($i + 1 -lt $filtered.Count) -and ($filtered[$i + 1] -eq "-")) {
                     $skipNext = $true
+                    $hadPipedArg = $true
                     continue
                 }
                 if ($filtered[$i] -match '^(-p|--print|--prompt)=-$') {
+                    $hadPipedArg = $true
                     continue
                 }
                 $res.Add($filtered[$i])
+            }
+
+            if ($hadPipedArg) {
+                $promptsDir = Ensure-MultigravityPromptsDir
+                $timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+                $guid = [System.Guid]::NewGuid().ToString("N").Substring(0, 8)
+                $pipedPromptFile = Join-Path $promptsDir "piped_prompt_${timestamp}_${guid}.md"
+                [System.IO.File]::WriteAllLines($pipedPromptFile, $pipelineBuffer, [System.Text.UTF8Encoding]::new($false))
+
+                $res.Add("-p")
+                $res.Add("Please read the prompt instructions from file '$pipedPromptFile' and inspect the current directory. Follow all instructions in that file.")
+                $pipelineBuffer = $null
             }
             [string[]]@($res)
         } else {
             [string[]]$filtered
         }
     } else { [string[]]@() }
+
+    # Check for oversized prompt string (> 4000 characters)
+    if ($cleanForwardArgs) {
+        $updatedArgs = [System.Collections.Generic.List[string]]::new()
+        for ($i = 0; $i -lt $cleanForwardArgs.Count; $i++) {
+            $arg = $cleanForwardArgs[$i]
+            if (($arg -in @("-p", "--print", "--prompt")) -and ($i + 1 -lt $cleanForwardArgs.Count)) {
+                $promptVal = $cleanForwardArgs[$i + 1]
+                if ($promptVal -and $promptVal.Length -gt 4000) {
+                    $promptsDir = Ensure-MultigravityPromptsDir
+                    $timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+                    $guid = [System.Guid]::NewGuid().ToString("N").Substring(0, 8)
+                    $spillPromptFile = Join-Path $promptsDir "large_prompt_${timestamp}_${guid}.md"
+                    [System.IO.File]::WriteAllText($spillPromptFile, $promptVal, [System.Text.UTF8Encoding]::new($false))
+
+                    $updatedArgs.Add($arg)
+                    $updatedArgs.Add("Please read the prompt instructions from file '$spillPromptFile' and inspect the current directory. Follow all instructions in that file.")
+                    $i++
+                    continue
+                }
+            }
+            $updatedArgs.Add($arg)
+        }
+        $cleanForwardArgs = [string[]]@($updatedArgs)
+    }
 
     $explicitConvId = $null
     if ($ArgsToForward) {
@@ -2263,12 +2357,16 @@ function Invoke-LaunchCLIProfile {
     $currentProc = [System.Diagnostics.Process]::GetCurrentProcess()
     $hadSavedCred = Prepare-LaunchCredential -PROFILE $PROFILE -ProcessId $currentProc.Id -ProcessType "cli" -StartTime $currentProc.StartTime -ForceSwitch:$forceSwitch -ConversationId $explicitConvId
 
+    # CLI runs synchronously in foreground with full ownership of the vault.
+    # Defaulting boot grace to 0 disables premature background vault restoration,
+    # preventing credentials from being clobbered mid-execution on large piped prompts,
+    # token network refreshes, or tool evaluations.
+    # When CLI exits, Restore-PostLaunchCredential safely persists refreshed tokens
+    # and restores global credentials at rest.
     $bootGraceMs = if ($null -ne $env:MULTIGRAVITY_BOOT_GRACE_MS) {
         [int]$env:MULTIGRAVITY_BOOT_GRACE_MS
-    } elseif ($env:MULTIGRAVITY_TEST_CRED_TARGET -or $env:MULTIGRAVITY_TEST_MODE) {
-        0
     } else {
-        2500
+        0
     }
 
     $asyncRestore = if (!$isGlobal -and $bootGraceMs -gt 0) {
@@ -2547,7 +2645,7 @@ function Invoke-RenameProfile {
         # Update global profile reference if OLD was global
         $currentGlobal = Get-GlobalProfile
         if ($currentGlobal -and $currentGlobal -eq $OLD) {
-            Set-Content -Path "$BASE\.global_profile" -Value $NEW -Encoding UTF8
+            [System.IO.File]::WriteAllText("$BASE\.global_profile", $NEW, [System.Text.UTF8Encoding]::new($false))
         }
 
         Write-Host "Successfully renamed profile '$OLD' to '$NEW'."
@@ -2852,7 +2950,7 @@ function Invoke-UpdateCli {
             Write-Error "Error: downloaded update payload is invalid or empty"
             Exit-Multigravity 1
         }
-        [System.IO.File]::WriteAllText($target, $result.Content, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($target, $result.Content, [System.Text.UTF8Encoding]::new($false))
         Write-Host "Successfully updated multigravity!"
         try { Ensure-MultigravityHooks -Force } catch {}
     } catch {

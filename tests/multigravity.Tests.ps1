@@ -374,7 +374,7 @@ uv run python "$mockPy" %*
 "@
     Set-Content -Path $mockCmd -Value $mockCmdContent
 
-    # 1. Pipeline Pass-Through & Single-Execution Verification (-p - stripped)
+    # 1. Pipeline Pass-Through & Single-Execution Verification (-p - converted to prompt file in .agents/tmp/prompts)
     $pipeLines = @("streamed prompt line 1", "streamed prompt line 2", "streamed prompt line 3")
     $pipeLines | & $MgScript cli pipe_prof -p -
 
@@ -382,11 +382,9 @@ uv run python "$mockPy" %*
     Assert-Equal $calls1 1 "Pipeline input executes CLI profile exactly once (no per-line multi-execution)"
 
     $args1 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
-    Assert-Equal $args1 "" "'-p -' flag is stripped when streaming pipeline input to CLI app"
-
-    $stdinContent = if (Test-Path $mockStdin) { (Get-Content $mockStdin -Raw).Trim() } else { "" }
-    $expectedStdin = ($pipeLines -join "`r`n")
-    Assert-Equal $stdinContent $expectedStdin "Full multi-line pipeline buffer correctly streamed into CLI stdin"
+    Assert-True ($args1 -match "-p Please read the prompt instructions from file") "'-p -' flag is converted to prompt file instruction"
+    Assert-True ($args1 -match "\.agents[\\/]tmp[\\/]prompts") "Prompt file is saved under .agents/tmp/prompts"
+    Assert-True (!(Test-Path $mockStdin)) "Pipeline with -p - passes prompt file instead of raw stdin"
 
     # 2. Interactive / Standard Non-Pipeline Invocation (no stdin pipe)
     Remove-Item $mockCallCount, $mockLog, $mockStdin -Force -ErrorAction SilentlyContinue
@@ -406,23 +404,21 @@ uv run python "$mockPy" %*
     Assert-Equal $LASTEXITCODE 42 "multigravity.ps1 forwards CLI non-zero exit code (42) back to caller"
     $env:MOCK_EXIT_CODE = $null
 
-    # 4. 'agy' alias with pipeline streaming (-p - stripped)
+    # 4. 'agy' alias with pipeline streaming (-p - converted to prompt file)
     Remove-Item $mockCallCount, $mockLog, $mockStdin -Force -ErrorAction SilentlyContinue
     "single line prompt" | & $MgScript agy pipe_prof -p -
     $calls3 = (Get-Content $mockCallCount -ErrorAction SilentlyContinue).Count
     Assert-Equal $calls3 1 "'agy' alias executes CLI profile exactly once"
     $args3 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
-    Assert-Equal $args3 "" "'agy' alias strips -p - when streaming pipeline"
-    $stdin3 = if (Test-Path $mockStdin) { (Get-Content $mockStdin -Raw).Trim() } else { "" }
-    Assert-Equal $stdin3 "single line prompt" "'agy' alias streams pipeline buffer"
+    Assert-True ($args3 -match "-p Please read the prompt instructions from file") "'agy' alias converts -p - to prompt file"
 
-    # 5. Pipeline with additional arguments (preserves other flags while stripping -p -)
+    # 5. Pipeline with additional arguments (preserves other flags while converting -p -)
     Remove-Item $mockCallCount, $mockLog, $mockStdin -Force -ErrorAction SilentlyContinue
     "multi-arg prompt" | & $MgScript cli pipe_prof --verbose -p - --model gemini-2.5-pro
     $args4 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
-    Assert-Equal $args4 "--verbose --model gemini-2.5-pro" "Other CLI flags preserved while stripping -p -"
-    $stdin4 = if (Test-Path $mockStdin) { (Get-Content $mockStdin -Raw).Trim() } else { "" }
-    Assert-Equal $stdin4 "multi-arg prompt" "Pipeline stream delivered alongside other flags"
+    Assert-True ($args4 -match "--verbose") "Other CLI flags preserved alongside prompt file"
+    Assert-True ($args4 -match "--model gemini-2.5-pro") "Model flag preserved"
+    Assert-True ($args4 -match "-p Please read the prompt instructions from file") "Piped prompt converted to prompt file"
 
     # 6. Non-pipelined invocation with -p preserved
     Remove-Item $mockCallCount, $mockLog, $mockStdin -Force -ErrorAction SilentlyContinue
@@ -430,6 +426,23 @@ uv run python "$mockPy" %*
     $args5 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
     Assert-Equal $args5 "-p non-piped prompt" "Non-pipelined -p argument preserved unchanged"
     Assert-True (!(Test-Path $mockStdin)) "Non-pipelined execution does not stream stdin"
+
+    # 7. Explicit --prompt-file argument
+    $testPromptSource = "$pipeBase\custom_source_prompt.md"
+    Set-Content -Path $testPromptSource -Value "Custom prompt source text"
+    Remove-Item $mockCallCount, $mockLog, $mockStdin -Force -ErrorAction SilentlyContinue
+    & $MgScript cli pipe_prof --prompt-file $testPromptSource
+    $args7 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
+    Assert-True ($args7 -match "-p Please read the prompt instructions from file") "--prompt-file converts to -p instruction"
+    Assert-True ($args7 -match "\.agents[\\/]tmp[\\/]prompts") "--prompt-file stores prompt file in .agents/tmp/prompts"
+
+    # 8. Oversized -p argument (> 4000 chars) auto-spills to .agents/tmp/prompts
+    $hugePrompt = "A" * 5000
+    Remove-Item $mockCallCount, $mockLog, $mockStdin -Force -ErrorAction SilentlyContinue
+    & $MgScript cli pipe_prof -p $hugePrompt
+    $args8 = if (Test-Path $mockLog) { (Get-Content $mockLog -Raw).Trim() } else { "" }
+    Assert-True ($args8 -match "-p Please read the prompt instructions from file") "Oversized prompt spills to file instruction"
+    Assert-True ($args8 -match "large_prompt_") "Oversized prompt stored in large_prompt_*.md"
 
 } finally {
     $env:MULTIGRAVITY_CLI_APP = $null
@@ -757,6 +770,9 @@ try {
     Register-HookInConfigFile $suite10HooksJson $testHookCmd
 
     Assert-True (Test-Path $suite10HooksJson) "hooks.json exists after registration"
+    $rawBytes = [System.IO.File]::ReadAllBytes($suite10HooksJson)
+    $hasBom = ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF)
+    Assert-True (-not $hasBom) "hooks.json is written as UTF-8 without BOM"
     $hooksObj = Get-Content $suite10HooksJson -Raw | ConvertFrom-Json
     Assert-True ($null -ne $hooksObj."my-custom-linter") "Pre-existing custom hook preserved during registration"
     Assert-Equal $hooksObj."my-custom-linter".PreInvocation[0].command "C:\tools\linter.cmd" "Pre-existing hook command unchanged"
