@@ -835,6 +835,11 @@ try {
     $hooksStatusOut = & $psCoreExe -NoProfile -ExecutionPolicy Bypass -File $MgScript hooks status
     Assert-Equal $LASTEXITCODE 0 "Executing 'multigravity hooks status' exits with code 0"
 
+    # 7. Hook script contains background quota update telemetry logic
+    $hookScriptContent = Get-Content $hookPs1Path -Raw
+    Assert-True ($hookScriptContent.Contains("Update-ProfileQuotaCache")) "Hook script contains background quota update invocation"
+    Assert-True ($hookScriptContent.Contains('$quotaCachePath.lock')) "Hook script implements lockfile check to avoid concurrent quota workers"
+
 } finally {
     if ($dummyHookProc -and -not $dummyHookProc.HasExited) {
         Stop-Process -Id $dummyHookProc.Id -Force -ErrorAction SilentlyContinue
@@ -1043,6 +1048,11 @@ try {
     $quotaCliOut = (& $psCoreExe -NoProfile -ExecutionPolicy Bypass -File $MgScript quota) | Out-String
     Assert-Equal $LASTEXITCODE 0 "Executing 'multigravity quota' exits with code 0"
     Assert-True ($quotaCliOut.Contains("QUOTA (5H / WK)")) "'multigravity quota' renders profile table with QUOTA column"
+
+    # 7. Verify multigravity status defaults to fast -SkipFetch without live credential fetches
+    $statusCliOut = (& $psCoreExe -NoProfile -ExecutionPolicy Bypass -File $MgScript status) | Out-String
+    Assert-Equal $LASTEXITCODE 0 "Executing 'multigravity status' exits with code 0"
+    Assert-True ($statusCliOut.Contains("G: 10%/5% | 3P: 50%")) "'multigravity status' defaults to -SkipFetch and displays cached quota"
 
 } finally {
     $env:MULTIGRAVITY_TEST_SKIP_QUOTA_FETCH = $null

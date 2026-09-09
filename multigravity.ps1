@@ -70,6 +70,13 @@ $BASE = Get-BaseDir
 $env:MULTIGRAVITY_ROOT_USERPROFILE = $ROOT_USERPROFILE
 $env:MULTIGRAVITY_HOME = $BASE
 
+if (-not $env:MULTIGRAVITY_SCRIPT_PATH) {
+    $scriptCand = if ($PSCommandPath) { $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { $null }
+    if ($scriptCand -and (Test-Path $scriptCand)) {
+        $env:MULTIGRAVITY_SCRIPT_PATH = $scriptCand
+    }
+}
+
 function Find-Antigravity {
     $paths = @(
         "$ROOT_USERPROFILE\AppData\Local\Programs\Antigravity\Antigravity.exe",
@@ -446,8 +453,8 @@ function Get-ActiveConversationIdForPid {
 $script:MultigravityHookScriptContent = @'
 <#
 .SYNOPSIS
-    Antigravity PreInvocation Lifecycle Hook for Multigravity Conversation Tracking.
-    Receives JSON on stdin, updates .active_instances.json, and returns {} on stdout.
+    Antigravity PreInvocation Lifecycle Hook for Multigravity Conversation Tracking & Usage Telemetry.
+    Receives JSON on stdin, updates .active_instances.json, triggers background usage refresh, and returns {} on stdout.
 #>
 [CmdletBinding()]
 param()
@@ -513,59 +520,137 @@ try {
 
     if ($targetPid -le 0) { return }
 
-    # 4. Fast check: is conversation_id already matching?
+    # 4. Resolve instance record & determine if conversation_id needs updating
+    $instanceProfile = $null
+    $needConvUpdate = $true
     try {
         $rawRegFast = [System.IO.File]::ReadAllText($regPath, [System.Text.Encoding]::UTF8)
         $regFastObj = $rawRegFast | ConvertFrom-Json
         if ($regFastObj.instances) {
             foreach ($inst in $regFastObj.instances) {
-                if ([int]$inst.pid -eq $targetPid -and $inst.conversation_id -eq $convId) {
-                    return
-                }
-            }
-        }
-    } catch {}
-
-    # 5. Acquire vault mutex and update registry if changed
-    $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $mutexName = "Local\Multigravity_Vault_Mutex_$userSid"
-    $mutex = $null
-    $acquired = $false
-
-    try {
-        $mutex = New-Object System.Threading.Mutex($false, $mutexName)
-        try {
-            $acquired = $mutex.WaitOne(2000)
-        } catch [System.Threading.AbandonedMutexException] {
-            $acquired = $true
-        }
-        if (-not $acquired) { return }
-
-        $rawReg = [System.IO.File]::ReadAllText($regPath, [System.Text.Encoding]::UTF8)
-        $regObj = $rawReg | ConvertFrom-Json
-        $updated = $false
-
-        if ($regObj.instances) {
-            foreach ($inst in $regObj.instances) {
                 if ([int]$inst.pid -eq $targetPid) {
-                    if ($inst.conversation_id -ne $convId) {
-                        $inst | Add-Member -NotePropertyName "conversation_id" -NotePropertyValue $convId -Force
-                        $updated = $true
+                    $instanceProfile = $inst.profile
+                    if ($inst.conversation_id -eq $convId) {
+                        $needConvUpdate = $false
                     }
                     break
                 }
             }
         }
+    } catch {}
 
-        if ($updated) {
-            $newJson = $regObj | ConvertTo-Json -Depth 5
-            $tmpPath = "$regPath.tmp"
-            [System.IO.File]::WriteAllText($tmpPath, $newJson, [System.Text.UTF8Encoding]::new($false))
-            Move-Item -Path $tmpPath -Destination $regPath -Force
+    # 5. Acquire vault mutex and update registry ONLY if conversation ID changed
+    if ($needConvUpdate) {
+        $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $mutexName = "Local\Multigravity_Vault_Mutex_$userSid"
+        $mutex = $null
+        $acquired = $false
+
+        try {
+            $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+            try {
+                $acquired = $mutex.WaitOne(2000)
+            } catch [System.Threading.AbandonedMutexException] {
+                $acquired = $true
+            }
+            if ($acquired) {
+                $rawReg = [System.IO.File]::ReadAllText($regPath, [System.Text.Encoding]::UTF8)
+                $regObj = $rawReg | ConvertFrom-Json
+                $updated = $false
+
+                if ($regObj.instances) {
+                    foreach ($inst in $regObj.instances) {
+                        if ([int]$inst.pid -eq $targetPid) {
+                            if ($inst.conversation_id -ne $convId) {
+                                $inst | Add-Member -NotePropertyName "conversation_id" -NotePropertyValue $convId -Force
+                                $updated = $true
+                            }
+                            if (-not $instanceProfile) {
+                                $instanceProfile = $inst.profile
+                            }
+                            break
+                        }
+                    }
+                }
+
+                if ($updated) {
+                    $newJson = $regObj | ConvertTo-Json -Depth 5
+                    $tmpPath = "$regPath.tmp"
+                    [System.IO.File]::WriteAllText($tmpPath, $newJson, [System.Text.UTF8Encoding]::new($false))
+                    Move-Item -Path $tmpPath -Destination $regPath -Force
+                }
+            }
+        } finally {
+            if ($acquired -and $mutex) { try { $mutex.ReleaseMutex() } catch {} }
+            if ($mutex) { try { $mutex.Dispose() } catch {} }
         }
-    } finally {
-        if ($acquired -and $mutex) { try { $mutex.ReleaseMutex() } catch {} }
-        if ($mutex) { try { $mutex.Dispose() } catch {} }
+    }
+
+    # 6. Usage Telemetry: Write usage to file in background for this active profile on each chat/iteration
+    if ($instanceProfile -and -not $env:MULTIGRAVITY_TEST_SKIP_QUOTA_FETCH -and -not $env:MULTIGRAVITY_TEST_CRED_TARGET) {
+        $globalProfFile = Join-Path $baseDir ".global_profile"
+        $isGlobalProf = ($instanceProfile -eq "global-profile")
+        if (-not $isGlobalProf -and (Test-Path $globalProfFile)) {
+            try {
+                $gName = (Get-Content $globalProfFile -Raw).Trim()
+                if ($gName -eq $instanceProfile) { $isGlobalProf = $true }
+            } catch {}
+        }
+
+        $quotaCachePath = if ($isGlobalProf) {
+            Join-Path $baseDir ".global_quota_cache.json"
+        } else {
+            Join-Path (Join-Path $baseDir $instanceProfile) ".quota_cache.json"
+        }
+
+        $lockPath = "$quotaCachePath.lock"
+        $now = [DateTime]::UtcNow
+        $shouldUpdate = $true
+
+        # Throttle: Check if cache is fresh (< 60s) or lock file is recent (< 30s)
+        if (Test-Path $quotaCachePath) {
+            try {
+                $fileTime = [System.IO.File]::GetLastWriteTimeUtc($quotaCachePath)
+                if (($now - $fileTime).TotalSeconds -lt 60) {
+                    $shouldUpdate = $false
+                }
+            } catch {}
+        }
+
+        if ($shouldUpdate -and (Test-Path $lockPath)) {
+            try {
+                $lockTime = [System.IO.File]::GetLastWriteTimeUtc($lockPath)
+                if (($now - $lockTime).TotalSeconds -lt 30) {
+                    $shouldUpdate = $false
+                }
+            } catch {}
+        }
+
+        if ($shouldUpdate) {
+            try {
+                $cacheDir = Split-Path -Parent $quotaCachePath
+                if (-not (Test-Path $cacheDir)) {
+                    New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+                }
+                [System.IO.File]::WriteAllText($lockPath, $now.ToString("o"), [System.Text.Encoding]::UTF8)
+
+                # Locate multigravity script
+                $mgScriptPath = $env:MULTIGRAVITY_SCRIPT_PATH
+                if (-not $mgScriptPath -or -not (Test-Path $mgScriptPath)) {
+                    $cand1 = Join-Path $userProfile ".local\bin\multigravity.ps1"
+                    if (Test-Path $cand1) {
+                        $mgScriptPath = $cand1
+                    }
+                }
+
+                if ($mgScriptPath -and (Test-Path $mgScriptPath)) {
+                    $psExe = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh.exe" } else { "powershell.exe" }
+                    # Background quota update worker for active profile: Update-ProfileQuotaCache via CLI dispatcher
+                    $workerCmd = "& { try { & '$mgScriptPath' quota '$instanceProfile' --refresh *>`$null } finally { if (Test-Path '$lockPath') { Remove-Item '$lockPath' -Force -ErrorAction SilentlyContinue } } }"
+                    Start-Process -FilePath $psExe -ArgumentList @("-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-Command", $workerCmd) -ErrorAction SilentlyContinue | Out-Null
+                }
+            } catch {}
+        }
     }
 } catch {
 } finally {
@@ -676,8 +761,17 @@ function Ensure-MultigravityHooks {
     $hookPs1Path = Join-Path $installDir "multigravity-hook.ps1"
     $hookCmdPath = Join-Path $installDir "multigravity-hook.cmd"
 
-    # Write hook script and wrapper if missing or forced
-    if ($Force -or (-not (Test-Path $hookPs1Path))) {
+    # Write hook script and wrapper if missing, forced, or out of date
+    $needPs1 = $Force -or (-not (Test-Path $hookPs1Path))
+    if (-not $needPs1) {
+        try {
+            $curHook = [System.IO.File]::ReadAllText($hookPs1Path, [System.Text.Encoding]::UTF8)
+            if ($curHook -ne $script:MultigravityHookScriptContent) {
+                $needPs1 = $true
+            }
+        } catch { $needPs1 = $true }
+    }
+    if ($needPs1) {
         [System.IO.File]::WriteAllText($hookPs1Path, $script:MultigravityHookScriptContent, [System.Text.UTF8Encoding]::new($false))
     }
     if ($Force -or (-not (Test-Path $hookCmdPath))) {
@@ -2559,6 +2653,26 @@ function Invoke-LaunchCLIProfile {
         }
     }
 
+    # Detect if invocation was specifically requesting /usage
+    $isUsagePrompt = $false
+    if ($cleanForwardArgs) {
+        for ($i = 0; $i -lt $cleanForwardArgs.Count; $i++) {
+            $arg = $cleanForwardArgs[$i]
+            if (($arg -in @("-p", "--print", "--prompt")) -and ($i + 1 -lt $cleanForwardArgs.Count)) {
+                if ($cleanForwardArgs[$i + 1] -match '^\s*/?usage(\s|$)') {
+                    $isUsagePrompt = $true
+                    break
+                }
+            } elseif ($arg -match '^(-p|--print|--prompt)=\s*/?usage(\s|$)') {
+                $isUsagePrompt = $true
+                break
+            } elseif ($arg -match '^\s*/?usage(\s|$)') {
+                $isUsagePrompt = $true
+                break
+            }
+        }
+    }
+
     $currentProc = [System.Diagnostics.Process]::GetCurrentProcess()
     $hadSavedCred = Prepare-LaunchCredential -PROFILE $PROFILE -ProcessId $currentProc.Id -ProcessType "cli" -StartTime $currentProc.StartTime -ForceSwitch:$forceSwitch -ConversationId $explicitConvId
 
@@ -2608,6 +2722,13 @@ function Invoke-LaunchCLIProfile {
             $env:USERPROFILE  = $oldUserProfile
             $env:APPDATA      = $oldAppData
             $env:LOCALAPPDATA = $oldLocalAppData
+        }
+
+        # If CLI invocation specifically requested /usage, update local quota cache for this profile
+        if ($isUsagePrompt -and (-not $env:MULTIGRAVITY_TEST_SKIP_QUOTA_FETCH) -and (-not $env:MULTIGRAVITY_TEST_CRED_TARGET)) {
+            try {
+                Update-ProfileQuotaCache -ProfileName $PROFILE | Out-Null
+            } catch {}
         }
 
         Restore-PostLaunchCredential -PROFILE $PROFILE -HadSavedCred $hadSavedCred -ProcessId $currentProc.Id
@@ -3764,7 +3885,11 @@ function Invoke-StatusProfiles {
         } elseif (Test-Path "$($d.FullName)\.shared") { "shared" } else { "full" }
         $lastUsed = $d.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
         $size     = Get-FolderSize $d.FullName
-        $quota    = Get-ProfileQuotaSummary -ProfileName $d.Name -Refresh:$RefreshQuota
+        $quota    = if ($RefreshQuota) {
+            Get-ProfileQuotaSummary -ProfileName $d.Name -Refresh
+        } else {
+            Get-ProfileQuotaSummary -ProfileName $d.Name -SkipFetch
+        }
 
         if ($running -ne "no") {
             Write-Host ("{0,-18} " -f $d.Name) -NoNewline
@@ -4146,7 +4271,11 @@ try {
             $targetProf = if ($arg1 -and $arg1 -notin @("--refresh", "-f")) { $arg1 } else { $null }
             if ($targetProf) {
                 Write-Host "Quota for profile '$targetProf':"
-                $q = Get-ProfileQuotaSummary -ProfileName $targetProf -Refresh
+                $q = if ($refreshQuota) {
+                    Get-ProfileQuotaSummary -ProfileName $targetProf -Refresh
+                } else {
+                    Get-ProfileQuotaSummary -ProfileName $targetProf
+                }
                 Write-Host "  $q"
             } else {
                 Invoke-StatusProfiles -RefreshQuota:$refreshQuota
