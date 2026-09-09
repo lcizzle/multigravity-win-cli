@@ -971,6 +971,84 @@ try {
     Remove-Item -Recurse -Force $suite11TestBase -ErrorAction SilentlyContinue
 }
 
+# ── Test Suite 12: Quota Telemetry, Cache Invalidation & Status Output ──
+Write-Host ""
+Write-Host "Suite 12: Quota Telemetry, Cache Invalidation & Status Output"
+
+$suite12TestBase = (Join-Path $testRoot "mg_quota_test_$PID")
+$env:MULTIGRAVITY_HOME = $suite12TestBase
+$suite12CredTarget = "gemini:antigravity_test_quota_$PID"
+$env:MULTIGRAVITY_TEST_CRED_TARGET = $suite12CredTarget
+$env:MULTIGRAVITY_TEST_SKIP_QUOTA_FETCH = "1"
+$psCoreExe = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh.exe" } else { "powershell.exe" }
+
+try {
+    New-Item -ItemType Directory -Force -Path (Join-Path $suite12TestBase "profQ1") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $suite12TestBase "profQ2") | Out-Null
+
+    # 1. Test Get-ProfileQuotaCachePath routing
+    $pathQ1 = Get-ProfileQuotaCachePath "profQ1"
+    $expectedPathQ1 = Join-Path (Join-Path $suite12TestBase "profQ1") ".quota_cache.json"
+    Assert-Equal $pathQ1 $expectedPathQ1 "Get-ProfileQuotaCachePath returns profile-specific cache path"
+
+    Set-Content -Path (Join-Path $suite12TestBase ".global_profile") -Value "profQ1" -Encoding UTF8
+    $pathGlobal = Get-ProfileQuotaCachePath "profQ1"
+    $expectedPathGlobal = Join-Path $suite12TestBase ".global_quota_cache.json"
+    Assert-Equal $pathGlobal $expectedPathGlobal "Get-ProfileQuotaCachePath returns global cache path when profile matches global"
+
+    # Reset global profile
+    Remove-Item (Join-Path $suite12TestBase ".global_profile") -Force -ErrorAction SilentlyContinue
+
+    # 2. Test Get-ProfileQuotaSummary for profile without credentials
+    $summaryNoCred = Get-ProfileQuotaSummary -ProfileName "profQ2"
+    Assert-Equal $summaryNoCred "-" "Get-ProfileQuotaSummary returns '-' for profile without credentials"
+
+    # 3. Test Get-ProfileQuotaSummary with valid cache
+    $dummyBlob = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("test_blob"))
+    $credData = @{ userName = "user_q1"; blob = $dummyBlob; updated = (Get-Date).ToString("o") } | ConvertTo-Json
+    Set-Content -Path (Join-Path (Join-Path $suite12TestBase "profQ1") ".credentials.json") -Value $credData -Encoding UTF8
+
+    $cachedSummary = "G: 65%/30% | 3P: 100%"
+    $cacheObj = @{
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
+        profile   = "profQ1"
+        summary   = $cachedSummary
+        raw       = @{}
+    }
+    $cacheJson = $cacheObj | ConvertTo-Json
+    Set-Content -Path (Join-Path (Join-Path $suite12TestBase "profQ1") ".quota_cache.json") -Value $cacheJson -Encoding UTF8
+
+    $summaryWithCache = Get-ProfileQuotaSummary -ProfileName "profQ1"
+    Assert-Equal $summaryWithCache $cachedSummary "Get-ProfileQuotaSummary returns cached summary when unexpired"
+
+    # 4. Test SkipFetch flag returns cache even if expired
+    $oldCacheObj = @{
+        timestamp = (Get-Date).AddHours(-2).ToUniversalTime().ToString("o")
+        profile   = "profQ1"
+        summary   = "G: 10%/5% | 3P: 50%"
+        raw       = @{}
+    }
+    $oldCacheJson = $oldCacheObj | ConvertTo-Json
+    Set-Content -Path (Join-Path (Join-Path $suite12TestBase "profQ1") ".quota_cache.json") -Value $oldCacheJson -Encoding UTF8
+
+    $summarySkipFetch = Get-ProfileQuotaSummary -ProfileName "profQ1" -SkipFetch
+    Assert-Equal $summarySkipFetch "G: 10%/5% | 3P: 50%" "Get-ProfileQuotaSummary with -SkipFetch returns existing cache regardless of age"
+
+    # 5. Verify Invoke-StatusProfiles renders QUOTA (5H / WK) column and cached value
+    $statusOut = (& { Invoke-StatusProfiles } 6>&1 | Out-String)
+    Assert-True ($statusOut.Contains("QUOTA (5H / WK)")) "Invoke-StatusProfiles includes QUOTA (5H / WK) column header"
+    Assert-True ($statusOut.Contains("G: 10%/5% | 3P: 50%")) "Invoke-StatusProfiles displays cached quota value in table"
+
+    # 6. Test CLI execution of 'multigravity quota'
+    $quotaCliOut = (& $psCoreExe -NoProfile -ExecutionPolicy Bypass -File $MgScript quota) | Out-String
+    Assert-Equal $LASTEXITCODE 0 "Executing 'multigravity quota' exits with code 0"
+    Assert-True ($quotaCliOut.Contains("QUOTA (5H / WK)")) "'multigravity quota' renders profile table with QUOTA column"
+
+} finally {
+    $env:MULTIGRAVITY_TEST_SKIP_QUOTA_FETCH = $null
+    Remove-Item -Recurse -Force $suite12TestBase -ErrorAction SilentlyContinue
+}
+
 # ── Cleanup Test Environment Variables ──
 $env:MULTIGRAVITY_HOME = $null
 $env:MULTIGRAVITY_TEST_CRED_TARGET = $null
