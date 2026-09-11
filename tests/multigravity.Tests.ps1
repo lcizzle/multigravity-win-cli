@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
 Automated test suite for multigravity-win-cli.
 #>
@@ -1056,6 +1056,87 @@ try {
     Assert-Equal $LASTEXITCODE 0 "Executing 'multigravity status' exits with code 0"
     Assert-True ($statusCliOut.Contains("G: 10%/5% | 3P: 50%")) "'multigravity status' defaults to -SkipFetch and displays cached quota"
 
+    # 8. Test CLI execution of 'multigravity quota <profile>' (no SwitchParameter collision)
+    $singleQuotaCliOut = (& $psCoreExe -NoProfile -ExecutionPolicy Bypass -File $MgScript quota profQ1) | Out-String
+    Assert-Equal $LASTEXITCODE 0 "Executing 'multigravity quota <profile>' exits with code 0"
+    Assert-True ($singleQuotaCliOut.Contains("G: 10%/5% | 3P: 50%")) "'multigravity quota <profile>' displays cached quota for target profile"
+
+    # 9. Verify Invoke-AgyUsageHeadless implementation suppresses WaitForExit output
+    $mgSource = Get-Content -Path $MgScript -Raw
+    Assert-True ($mgSource.Contains('$null = $proc.WaitForExit(15000)')) "Invoke-AgyUsageHeadless suppresses WaitForExit boolean output"
+
+    # 10. Test Format-RelativeTime unit logic
+    $nowUtc = [DateTime]::UtcNow
+    Assert-Equal (Format-RelativeTime ($nowUtc.AddMinutes(-5))) "ready" "Format-RelativeTime returns 'ready' for past timestamps"
+    Assert-Equal (Format-RelativeTime ($nowUtc.AddSeconds(30))) "<1m" "Format-RelativeTime returns '<1m' for under 60 seconds"
+    Assert-Equal (Format-RelativeTime ($nowUtc.AddMinutes(45))) "45m" "Format-RelativeTime returns '45m' for minute intervals"
+    Assert-Equal (Format-RelativeTime ($nowUtc.AddMinutes(75))) "1h 15m" "Format-RelativeTime returns '1h 15m' for hour + minute intervals"
+    Assert-Equal (Format-RelativeTime ($nowUtc.AddHours(2))) "2h" "Format-RelativeTime returns '2h' when minutes are zero"
+    Assert-Equal (Format-RelativeTime ($nowUtc.AddHours(53))) "2d 5h" "Format-RelativeTime returns '2d 5h' for multi-day intervals"
+    Assert-Equal (Format-RelativeTime ($nowUtc.AddDays(3))) "3d" "Format-RelativeTime returns '3d' when remaining hours are zero"
+    Assert-Equal (Format-RelativeTime $null) $null "Format-RelativeTime returns null for null input"
+    Assert-Equal (Format-RelativeTime "invalid_timestamp") $null "Format-RelativeTime returns null for unparseable input"
+
+    # 11. Test Format-ProfileQuotaSummary with raw payload and expiration formatting
+    $mockRaw = [PSCustomObject]@{
+        groups = @(
+            [PSCustomObject]@{
+                name = "Gemini Models"
+                buckets = @(
+                    [PSCustomObject]@{
+                        window = "5h"
+                        remaining_fraction = 0.96
+                        reset_time = $nowUtc.AddMinutes(75).ToString("o")
+                    },
+                    [PSCustomObject]@{
+                        window = "weekly"
+                        remaining_fraction = 0.02
+                        reset_time = $nowUtc.AddHours(53).ToString("o")
+                    }
+                )
+            },
+            [PSCustomObject]@{
+                name = "Claude and GPT models"
+                buckets = @(
+                    [PSCustomObject]@{
+                        window = "5h"
+                        remaining_fraction = 1.0
+                        reset_time = $nowUtc.AddHours(5).ToString("o")
+                    },
+                    [PSCustomObject]@{
+                        window = "weekly"
+                        remaining_fraction = 1.0
+                        reset_time = $nowUtc.AddDays(7).ToString("o")
+                    }
+                )
+            }
+        )
+    }
+    $summaryWithTimers = Format-ProfileQuotaSummary -RawData $mockRaw
+    Assert-True ($summaryWithTimers.Contains("G: 96% (1h 15m)/2% (2d 5h)")) "Format-ProfileQuotaSummary formats compact relative timers for consumed quotas"
+    Assert-True ($summaryWithTimers.Contains("3P: 100%")) "Format-ProfileQuotaSummary omits timers for 100% unconsumed quotas"
+
+    $summaryNoTimers = Format-ProfileQuotaSummary -RawData $mockRaw -NoTimers
+    Assert-Equal $summaryNoTimers "G: 96%/2% | 3P: 100%" "Format-ProfileQuotaSummary with -NoTimers outputs clean percentages without timers"
+
+    # 12. Test CLI execution of 'multigravity quota <profile>' with rich details
+    $richCacheObj = @{
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
+        profile   = "profQ1"
+        summary   = "G: 96%/2% | 3P: 100%"
+        raw       = $mockRaw
+    }
+    $richCacheJson = $richCacheObj | ConvertTo-Json -Depth 5
+    Set-Content -Path (Join-Path (Join-Path $suite12TestBase "profQ1") ".quota_cache.json") -Value $richCacheJson -Encoding UTF8
+
+    $richQuotaCliOut = (& $psCoreExe -NoProfile -ExecutionPolicy Bypass -File $MgScript quota profQ1) | Out-String
+    Assert-Equal $LASTEXITCODE 0 "Executing 'multigravity quota profQ1' exits with code 0"
+    Assert-True ($richQuotaCliOut.Contains("Gemini Models:")) "Detailed quota view includes Gemini Models section"
+    Assert-True ($richQuotaCliOut.Contains("Claude and GPT models:")) "Detailed quota view includes Claude and GPT models section"
+    Assert-True ($richQuotaCliOut.Contains("Weekly Limit")) "Detailed quota view includes Weekly Limit"
+    Assert-True ($richQuotaCliOut.Contains("5-Hour Limit")) "Detailed quota view includes 5-Hour Limit"
+    Assert-True ($richQuotaCliOut.Contains("resets in")) "Detailed quota view includes relative reset info"
+
 } finally {
     $env:MULTIGRAVITY_TEST_SKIP_QUOTA_FETCH = $null
     Remove-Item -Recurse -Force $suite12TestBase -ErrorAction SilentlyContinue
@@ -1180,7 +1261,8 @@ try {
 } finally {
     Remove-Item -Recurse -Force $suite13TestBase -ErrorAction SilentlyContinue
     # Restore user's API key if overwritten during unit tests
-    Set-OpenRouterApiKey "OPENROUTER_API_KEY_PLACEHOLDER" | Out-Null
+    # NOTE: Never hardcode real API keys here. Set OPENROUTER_API_KEY in your environment or CI secrets.
+    if ($env:OPENROUTER_API_KEY) { Set-OpenRouterApiKey $env:OPENROUTER_API_KEY | Out-Null }
 }
 
 # ==============================================================================

@@ -1881,10 +1881,152 @@ function Invoke-AgyUsageHeadless {
         $proc = [System.Diagnostics.Process]::Start($psi)
         if (-not $proc) { return $null }
         $stdout = $proc.StandardOutput.ReadToEnd()
-        $proc.WaitForExit(15000)
+        $null = $proc.WaitForExit(15000)
         return $stdout
     } catch {
         return $null
+    }
+}
+
+function Format-RelativeTime {
+    param([object]$ResetTime)
+    if (-not $ResetTime) { return $null }
+    try {
+        $dt = if ($ResetTime -is [DateTime]) {
+            $ResetTime.ToUniversalTime()
+        } else {
+            [DateTime]::Parse([string]$ResetTime, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+        }
+        $diff = $dt - [DateTime]::UtcNow
+        if ($diff.TotalSeconds -le 0) { return "ready" }
+        if ($diff.TotalSeconds -lt 60) { return "<1m" }
+        $totalMinutes = [int][Math]::Round($diff.TotalMinutes)
+        $totalHours = [int][Math]::Floor($totalMinutes / 60)
+        $mins = $totalMinutes % 60
+        $days = [int][Math]::Floor($totalHours / 24)
+        $remHours = $totalHours % 24
+        if ($days -ge 1) {
+            if ($remHours -gt 0) { return "${days}d ${remHours}h" }
+            return "${days}d"
+        }
+        if ($totalHours -ge 1) {
+            if ($mins -gt 0) { return "${totalHours}h ${mins}m" }
+            return "${totalHours}h"
+        }
+        return "${mins}m"
+    } catch { return $null }
+}
+
+function Format-ProfileQuotaSummary {
+    param(
+        [object]$RawData,
+        [string]$FallbackSummary = "-",
+        [switch]$NoTimers
+    )
+
+    if (-not $RawData -or -not $RawData.groups) {
+        return $FallbackSummary
+    }
+
+    try {
+        function Format-QuotaBucketText {
+            param([int]$pct, [string]$resetTime, [switch]$suppressTimers)
+            $text = "$pct%"
+            if ((-not $suppressTimers) -and $resetTime) {
+                $rel = Format-RelativeTime $resetTime
+                if ($rel -and ($rel -ne "ready" -or $pct -lt 100)) {
+                    $text = "$pct% ($rel)"
+                }
+            }
+            return $text
+        }
+
+        $g5h = $null
+        $g5hReset = $null
+        $gWk = $null
+        $gWkReset = $null
+        $p5h = $null
+        $p5hReset = $null
+        $pWk = $null
+        $pWkReset = $null
+
+        foreach ($grp in $RawData.groups) {
+            if ($grp.name -like "*Gemini*") {
+                foreach ($b in $grp.buckets) {
+                    if ($b.window -eq "5h") {
+                        if ($b.disabled -eq $true) {
+                            $g5h = 0
+                        } elseif ($b.remaining_fraction -lt 1.0 -and $b.remaining_fraction -gt 0.99) {
+                            $g5h = 99
+                            $g5hReset = $b.reset_time
+                        } else {
+                            $g5h = [math]::Round($b.remaining_fraction * 100)
+                            if ($b.disabled -ne $true) { $g5hReset = $b.reset_time }
+                        }
+                    }
+                    if ($b.window -eq "weekly") {
+                        if ($b.disabled -eq $true) {
+                            $gWk = 0
+                        } elseif ($b.remaining_fraction -lt 1.0 -and $b.remaining_fraction -gt 0.99) {
+                            $gWk = 99
+                            $gWkReset = $b.reset_time
+                        } else {
+                            $gWk = [math]::Round($b.remaining_fraction * 100)
+                            if ($b.disabled -ne $true) { $gWkReset = $b.reset_time }
+                        }
+                    }
+                }
+            } elseif (($grp.name -like "*Claude*") -or ($grp.name -like "*3p*") -or ($grp.name -like "*GPT*")) {
+                foreach ($b in $grp.buckets) {
+                    if ($b.window -eq "5h") {
+                        if ($b.disabled -eq $true) {
+                            $p5h = 0
+                        } elseif ($b.remaining_fraction -lt 1.0 -and $b.remaining_fraction -gt 0.99) {
+                            $p5h = 99
+                            $p5hReset = $b.reset_time
+                        } else {
+                            $p5h = [math]::Round($b.remaining_fraction * 100)
+                            if ($b.disabled -ne $true) { $p5hReset = $b.reset_time }
+                        }
+                    }
+                    if ($b.window -eq "weekly") {
+                        if ($b.disabled -eq $true) {
+                            $pWk = 0
+                        } elseif ($b.remaining_fraction -lt 1.0 -and $b.remaining_fraction -gt 0.99) {
+                            $pWk = 99
+                            $pWkReset = $b.reset_time
+                        } else {
+                            $pWk = [math]::Round($b.remaining_fraction * 100)
+                            if ($b.disabled -ne $true) { $pWkReset = $b.reset_time }
+                        }
+                    }
+                }
+            }
+        }
+
+        $parts = @()
+        if (($null -ne $g5h) -or ($null -ne $gWk)) {
+            $g5hStr = Format-QuotaBucketText -pct $g5h -resetTime $g5hReset -suppressTimers:$NoTimers
+            $gWkStr = Format-QuotaBucketText -pct $gWk -resetTime $gWkReset -suppressTimers:$NoTimers
+            $parts += "G: $g5hStr/$gWkStr"
+        }
+
+        if (($null -ne $p5h) -or ($null -ne $pWk)) {
+            if ($NoTimers -and ($p5h -eq 100) -and ($pWk -eq 100)) {
+                $parts += "3P: 100%"
+            } else {
+                $p5hStr = Format-QuotaBucketText -pct $p5h -resetTime $p5hReset -suppressTimers:$NoTimers
+                $pWkStr = Format-QuotaBucketText -pct $pWk -resetTime $pWkReset -suppressTimers:$NoTimers
+                $parts += "3P: $p5hStr/$pWkStr"
+            }
+        }
+
+        if ($parts.Count -gt 0) {
+            return ($parts -join " | ")
+        }
+        return $FallbackSummary
+    } catch {
+        return $FallbackSummary
     }
 }
 
@@ -1907,31 +2049,30 @@ function Update-ProfileQuotaCache {
         $rawJson = Invoke-WithVaultMutex {
             $credPath = Get-ProfileCredentialPath $ProfileName
             $credTarget = Get-TargetCredName
-            $reg = Get-ActiveInstancesRegistry
 
-            if ($reg.active_vault_profile -and ($reg.active_vault_profile -eq $ProfileName)) {
+            if (-not (Test-CredentialFileValid $credPath)) { return $null }
+            $content = Get-Content -Path $credPath -Raw -ErrorAction Stop
+            if ([string]::IsNullOrWhiteSpace($content)) { return $null }
+            $jsonCred = $content | ConvertFrom-Json -ErrorAction Stop
+            if (-not $jsonCred.blob) { return $null }
+
+            $curUserName = $null
+            $curBlob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$curUserName)
+
+            if ($curBlob -and ($curBlob -eq $jsonCred.blob)) {
                 $res = Invoke-AgyUsageHeadless -CliAppPath $CLI_APP
                 return ($res | Out-String)
-            } else {
-                if (-not (Test-CredentialFileValid $credPath)) { return $null }
-                $content = Get-Content -Path $credPath -Raw -ErrorAction Stop
-                if ([string]::IsNullOrWhiteSpace($content)) { return $null }
-                $jsonCred = $content | ConvertFrom-Json -ErrorAction Stop
-                if (-not $jsonCred.blob) { return $null }
+            }
 
-                $curUserName = $null
-                $curBlob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$curUserName)
-
-                try {
-                    [MultigravityCredVault]::ImportCredential($credTarget, $jsonCred.userName, $jsonCred.blob) | Out-Null
-                    $res = Invoke-AgyUsageHeadless -CliAppPath $CLI_APP
-                    return ($res | Out-String)
-                } finally {
-                    if ($curBlob) {
-                        [MultigravityCredVault]::ImportCredential($credTarget, $curUserName, $curBlob) | Out-Null
-                    } else {
-                        [MultigravityCredVault]::RemoveCredential($credTarget) | Out-Null
-                    }
+            try {
+                [MultigravityCredVault]::ImportCredential($credTarget, $jsonCred.userName, $jsonCred.blob) | Out-Null
+                $res = Invoke-AgyUsageHeadless -CliAppPath $CLI_APP
+                return ($res | Out-String)
+            } finally {
+                if ($curBlob) {
+                    [MultigravityCredVault]::ImportCredential($credTarget, $curUserName, $curBlob) | Out-Null
+                } else {
+                    [MultigravityCredVault]::RemoveCredential($credTarget) | Out-Null
                 }
             }
         }
@@ -1953,6 +2094,8 @@ function Update-ProfileQuotaCache {
                     if ($b.window -eq "5h") {
                         if ($b.disabled -eq $true) {
                             $g5h = 0
+                        } elseif ($b.remaining_fraction -lt 1.0 -and $b.remaining_fraction -gt 0.99) {
+                            $g5h = 99
                         } else {
                             $g5h = [math]::Round($b.remaining_fraction * 100)
                         }
@@ -1960,6 +2103,8 @@ function Update-ProfileQuotaCache {
                     if ($b.window -eq "weekly") {
                         if ($b.disabled -eq $true) {
                             $gWk = 0
+                        } elseif ($b.remaining_fraction -lt 1.0 -and $b.remaining_fraction -gt 0.99) {
+                            $gWk = 99
                         } else {
                             $gWk = [math]::Round($b.remaining_fraction * 100)
                         }
@@ -1970,6 +2115,8 @@ function Update-ProfileQuotaCache {
                     if ($b.window -eq "5h") {
                         if ($b.disabled -eq $true) {
                             $p5h = 0
+                        } elseif ($b.remaining_fraction -lt 1.0 -and $b.remaining_fraction -gt 0.99) {
+                            $p5h = 99
                         } else {
                             $p5h = [math]::Round($b.remaining_fraction * 100)
                         }
@@ -1977,6 +2124,8 @@ function Update-ProfileQuotaCache {
                     if ($b.window -eq "weekly") {
                         if ($b.disabled -eq $true) {
                             $pWk = 0
+                        } elseif ($b.remaining_fraction -lt 1.0 -and $b.remaining_fraction -gt 0.99) {
+                            $pWk = 99
                         } else {
                             $pWk = [math]::Round($b.remaining_fraction * 100)
                         }
@@ -2013,6 +2162,7 @@ function Update-ProfileQuotaCache {
                 New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
             }
             [System.IO.File]::WriteAllText($cachePath, $jsonOut, [System.Text.UTF8Encoding]::new($false))
+            return (Format-ProfileQuotaSummary -RawData $parsed.command.data -FallbackSummary $summary)
         }
         return $summary
     } catch {
@@ -2030,7 +2180,8 @@ function Get-ProfileQuotaSummary {
     param(
         [string]$ProfileName,
         [switch]$SkipFetch,
-        [switch]$Refresh
+        [switch]$Refresh,
+        [switch]$NoTimers
     )
 
     if (-not (Test-ProfileHasValidCredential $ProfileName)) {
@@ -2044,18 +2195,19 @@ function Get-ProfileQuotaSummary {
             if (-not [string]::IsNullOrWhiteSpace($content)) {
                 $cache = $content | ConvertFrom-Json -ErrorAction Stop
                 if ($cache -and $cache.summary -and ($cache.summary -ne "-")) {
+                    $dynSummary = Format-ProfileQuotaSummary -RawData $cache.raw -FallbackSummary $cache.summary -NoTimers:$NoTimers
                     if ($SkipFetch) {
-                        return $cache.summary
+                        return $dynSummary
                     }
                     if ($cache.timestamp) {
                         $cacheUtc = ([datetime]$cache.timestamp).ToUniversalTime()
                         $nowUtc   = (Get-Date).ToUniversalTime()
                         $diffMin  = ($nowUtc - $cacheUtc).TotalMinutes
                         if ($diffMin -lt 15) {
-                            return $cache.summary
+                            return $dynSummary
                         }
                     } else {
-                        return $cache.summary
+                        return $dynSummary
                     }
                 }
             }
@@ -2066,7 +2218,9 @@ function Get-ProfileQuotaSummary {
         if (Test-Path $cachePath) {
             try {
                 $c = (Get-Content -Path $cachePath -Raw) | ConvertFrom-Json
-                if ($c -and $c.summary -and ($c.summary -ne "-")) { return $c.summary }
+                if ($c -and $c.summary -and ($c.summary -ne "-")) {
+                    return (Format-ProfileQuotaSummary -RawData $c.raw -FallbackSummary $c.summary -NoTimers:$NoTimers)
+                }
             } catch {}
         }
         return "-"
@@ -2074,16 +2228,103 @@ function Get-ProfileQuotaSummary {
 
     $updated = Update-ProfileQuotaCache -ProfileName $ProfileName
     if ($updated -ne "-") {
+        if ($NoTimers -and (Test-Path $cachePath)) {
+            try {
+                $c = (Get-Content -Path $cachePath -Raw) | ConvertFrom-Json
+                if ($c -and $c.summary) { return $c.summary }
+            } catch {}
+        }
         return $updated
     }
     # Fallback to cached summary if update failed/timed out
     if (Test-Path $cachePath) {
         try {
             $c = (Get-Content -Path $cachePath -Raw) | ConvertFrom-Json
-            if ($c -and $c.summary -and ($c.summary -ne "-")) { return $c.summary }
+            if ($c -and $c.summary -and ($c.summary -ne "-")) {
+                return (Format-ProfileQuotaSummary -RawData $c.raw -FallbackSummary $c.summary -NoTimers:$NoTimers)
+            }
         } catch {}
     }
     return "-"
+}
+
+function Invoke-ProfileQuotaDetail {
+    param(
+        [string]$ProfileName,
+        [switch]$Refresh
+    )
+
+    if (-not (Test-ProfileHasValidCredential $ProfileName)) {
+        Write-Host "Quota for profile '$ProfileName':"
+        Write-Host "  - (No saved credentials)"
+        return
+    }
+
+    $cachePath = Get-ProfileQuotaCachePath $ProfileName
+    if ($Refresh) {
+        $null = Update-ProfileQuotaCache -ProfileName $ProfileName
+    }
+
+    $cacheObj = $null
+    if (Test-Path $cachePath) {
+        try {
+            $content = Get-Content -Path $cachePath -Raw -ErrorAction SilentlyContinue
+            if (-not [string]::IsNullOrWhiteSpace($content)) {
+                $cacheObj = $content | ConvertFrom-Json -ErrorAction SilentlyContinue
+            }
+        } catch {}
+    }
+
+    if (-not $cacheObj) {
+        if (-not ($env:MULTIGRAVITY_TEST_SKIP_QUOTA_FETCH -or $env:MULTIGRAVITY_TEST_CRED_TARGET)) {
+            $null = Update-ProfileQuotaCache -ProfileName $ProfileName
+            if (Test-Path $cachePath) {
+                try {
+                    $content = Get-Content -Path $cachePath -Raw -ErrorAction SilentlyContinue
+                    if (-not [string]::IsNullOrWhiteSpace($content)) {
+                        $cacheObj = $content | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    }
+                } catch {}
+            }
+        }
+    }
+
+    Write-Host "Quota for profile '$ProfileName':"
+    if (-not $cacheObj) {
+        Write-Host "  -"
+        return
+    }
+
+    $summaryStr = Format-ProfileQuotaSummary -RawData $cacheObj.raw -FallbackSummary $cacheObj.summary
+    Write-Host "  $summaryStr"
+
+    if ($cacheObj.raw -and $cacheObj.raw.groups) {
+        Write-Host ""
+        if ($cacheObj.timestamp) {
+            try {
+                $cachedDt = ([datetime]$cacheObj.timestamp).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")
+                Write-Host "  Last synchronized: $cachedDt" -ForegroundColor DarkGray
+            } catch {}
+        }
+        foreach ($grp in $cacheObj.raw.groups) {
+            Write-Host "  $($grp.name):" -ForegroundColor Cyan
+            foreach ($b in $grp.buckets) {
+                $winName = if ($b.window -eq "5h") { "5-Hour Limit" } elseif ($b.window -eq "weekly") { "Weekly Limit" } else { $b.name }
+                $remPct = if ($b.disabled -eq $true) { "disabled" } else { "$([math]::Round($b.remaining_fraction * 100))%" }
+                $resetInfo = ""
+                if ($b.reset_time) {
+                    $rel = Format-RelativeTime $b.reset_time
+                    try {
+                        $localDt = ([DateTime]::Parse([string]$b.reset_time, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)).ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                        $resetInfo = if ($rel -eq "ready") { " (resets: ready)" } else { " (resets in $rel [$localDt])" }
+                    } catch {
+                        if ($rel) { $resetInfo = " (resets in $rel)" }
+                    }
+                }
+                Write-Host ("    {0,-15}: {1,8}{2}" -f $winName, $remPct, $resetInfo)
+            }
+        }
+    }
 }
 
 function Test-SharedProfile {
@@ -3662,17 +3903,17 @@ function Invoke-RealtimeStatusDashboard {
         Write-Host ""
 
         Write-Host "All Profiles:"
-        Write-Host ("{0,-18} {1,-10} {2,-16} {3,-18} {4,-10} {5}" -f "PROFILE", "RUNNING", "TYPE", "LAST USED", "SIZE", "QUOTA (5H / WK)")
-        Write-Host ("{0,-18} {1,-10} {2,-16} {3,-18} {4,-10} {5}" -f "-------", "-------", "----", "---------", "----", "-------------------")
+        Write-Host ("{0,-18} {1,-10} {2,-10} {3,-18} {4,-10} {5}" -f "PROFILE", "RUNNING", "TYPE", "LAST USED", "SIZE", "QUOTA (5H / WK)")
+        Write-Host ("{0,-18} {1,-10} {2,-10} {3,-18} {4,-10} {5}" -f "-------", "-------", "----", "---------", "----", "-------------------")
 
         foreach ($p in $profileRows) {
             $qStr = if ($p.Quota) { $p.Quota } else { "-" }
             if ($p.RunningCount -ne "no") {
                 Write-Host ("{0,-18} " -f $p.Name) -NoNewline
                 Write-Host ("{0,-10} " -f $p.RunningCount) -NoNewline -ForegroundColor Green
-                Write-Host ("{0,-16} {1,-18} {2,-10} {3}" -f $p.Type, $p.LastUsed, $p.Size, $qStr)
+                Write-Host ("{0,-10} {1,-18} {2,-10} {3}" -f $p.Type, $p.LastUsed, $p.Size, $qStr)
             } else {
-                Write-Host ("{0,-18} {1,-10} {2,-16} {3,-18} {4,-10} {5}" -f $p.Name, $p.RunningCount, $p.Type, $p.LastUsed, $p.Size, $qStr)
+                Write-Host ("{0,-18} {1,-10} {2,-10} {3,-18} {4,-10} {5}" -f $p.Name, $p.RunningCount, $p.Type, $p.LastUsed, $p.Size, $qStr)
             }
         }
 
@@ -3956,8 +4197,8 @@ function Invoke-StatusProfiles {
     Write-Host ""
 
     Write-Host "All Profiles:"
-    Write-Host ("{0,-18} {1,-10} {2,-16} {3,-18} {4,-10} {5}" -f "PROFILE", "RUNNING", "TYPE", "LAST USED", "SIZE", "QUOTA (5H / WK)")
-    Write-Host ("{0,-18} {1,-10} {2,-16} {3,-18} {4,-10} {5}" -f "-------", "-------", "----", "---------", "----", "-------------------")
+    Write-Host ("{0,-18} {1,-10} {2,-10} {3,-18} {4,-10} {5}" -f "PROFILE", "RUNNING", "TYPE", "LAST USED", "SIZE", "QUOTA (5H / WK)")
+    Write-Host ("{0,-18} {1,-10} {2,-10} {3,-18} {4,-10} {5}" -f "-------", "-------", "----", "---------", "----", "-------------------")
 
     $dirs = Get-ChildItem -Directory -Path $BASE -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ne ".templates" -and $_.Name -notlike ".*" }
@@ -3996,9 +4237,9 @@ function Invoke-StatusProfiles {
         if ($running -ne "no") {
             Write-Host ("{0,-18} " -f $d.Name) -NoNewline
             Write-Host ("{0,-10} " -f $running) -NoNewline -ForegroundColor Green
-            Write-Host ("{0,-16} {1,-18} {2,-10} {3}" -f $ptype, $lastUsed, $size, $quota)
+            Write-Host ("{0,-10} {1,-18} {2,-10} {3}" -f $ptype, $lastUsed, $size, $quota)
         } else {
-            Write-Host ("{0,-18} {1,-10} {2,-16} {3,-18} {4,-10} {5}" -f $d.Name, $running, $ptype, $lastUsed, $size, $quota)
+            Write-Host ("{0,-18} {1,-10} {2,-10} {3,-18} {4,-10} {5}" -f $d.Name, $running, $ptype, $lastUsed, $size, $quota)
         }
     }
 }
@@ -6194,21 +6435,15 @@ try {
             Invoke-ListProfiles
         }
         "status" {
-            $isRealTime = ($arg1 -in @("--realtime", "-r", "--live", "-l", "--watch", "-w") -or $extra -contains "--realtime" -or $extra -contains "-r")
-            $refreshQuota = ($arg1 -in @("--refresh", "-f", "--refresh-quota", "-q") -or $extra -contains "--refresh" -or $extra -contains "-f" -or $extra -contains "--refresh-quota" -or $extra -contains "-q")
+            $isRealTime = ($arg1 -in @("--realtime", "-r", "--live", "-l", "--watch", "-w") -or $arg2 -in @("--realtime", "-r", "--live", "-l", "--watch", "-w") -or $extra -contains "--realtime" -or $extra -contains "-r")
+            $refreshQuota = ($arg1 -in @("--refresh", "-f", "--refresh-quota", "-q") -or $arg2 -in @("--refresh", "-f", "--refresh-quota", "-q") -or $extra -contains "--refresh" -or $extra -contains "-f" -or $extra -contains "--refresh-quota" -or $extra -contains "-q" -or $q)
             Invoke-StatusProfiles -RealTime:$isRealTime -RefreshQuota:$refreshQuota
         }
         "quota" {
-            $refreshQuota = ($arg1 -in @("--refresh", "-f") -or $extra -contains "--refresh" -or $extra -contains "-f")
-            $targetProf = if ($arg1 -and $arg1 -notin @("--refresh", "-f")) { $arg1 } else { $null }
+            $refreshQuota = ($arg1 -in @("--refresh", "-f") -or $arg2 -in @("--refresh", "-f") -or $extra -contains "--refresh" -or $extra -contains "-f" -or $q)
+            $targetProf = if ($arg1 -and ($arg1 -notin @("--refresh", "-f"))) { $arg1 } else { $null }
             if ($targetProf) {
-                Write-Host "Quota for profile '$targetProf':"
-                $q = if ($refreshQuota) {
-                    Get-ProfileQuotaSummary -ProfileName $targetProf -Refresh
-                } else {
-                    Get-ProfileQuotaSummary -ProfileName $targetProf
-                }
-                Write-Host "  $q"
+                Invoke-ProfileQuotaDetail -ProfileName $targetProf -Refresh:$refreshQuota
             } else {
                 Invoke-StatusProfiles -RefreshQuota:$refreshQuota
             }
