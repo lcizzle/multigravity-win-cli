@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Automated test suite for multigravity-win-cli.
 #>
@@ -460,7 +460,7 @@ $job = Start-Job -ScriptBlock {
     param($mName)
     $m = [System.Threading.Mutex]::new($true, $mName)
     Start-Sleep -Seconds 3
-    $m.ReleaseMutex()
+    try { $m.ReleaseMutex() } catch {}
     $m.Dispose()
 } -ArgumentList $mutexName
 
@@ -633,13 +633,13 @@ try {
     Assert-Equal $finalUser "user_global" "Global profile credentials restored when all instances terminate"
 
     # 6. Verify parent-child process tracking and hierarchical status tree display
-    $parentDummy = Start-Process powershell.exe -ArgumentList "-NoProfile -Command Start-Sleep -Seconds 60" -PassThru
-    $childDummy  = Start-Process powershell.exe -ArgumentList "-NoProfile -Command Start-Sleep -Seconds 60" -PassThru
+    $parentDummy = Start-Process powershell.exe -ArgumentList "-NoProfile -NonInteractive -Command Start-Sleep -Seconds 60" -PassThru
+    $childDummy  = Start-Process powershell.exe -ArgumentList "-NoProfile -NonInteractive -Command Start-Sleep -Seconds 60" -PassThru
     try {
-        Prepare-LaunchCredential -PROFILE "profA" -ProcessId $parentDummy.Id -ProcessType "cli" | Out-Null
+        Prepare-LaunchCredential -PROFILE "profA" -ProcessId $parentDummy.Id -ProcessType "cli" -StartTime $parentDummy.StartTime | Out-Null
         
         $env:MULTIGRAVITY_ACTIVE_PID = $parentDummy.Id
-        Prepare-LaunchCredential -PROFILE "profB" -ProcessId $childDummy.Id -ProcessType "cli" | Out-Null
+        Prepare-LaunchCredential -PROFILE "profB" -ProcessId $childDummy.Id -ProcessType "cli" -StartTime $childDummy.StartTime | Out-Null
         $env:MULTIGRAVITY_ACTIVE_PID = $null
 
         $regPC = Get-ActiveInstancesRegistry
@@ -839,6 +839,8 @@ try {
     $hookScriptContent = Get-Content $hookPs1Path -Raw
     Assert-True ($hookScriptContent.Contains("Update-ProfileQuotaCache")) "Hook script contains background quota update invocation"
     Assert-True ($hookScriptContent.Contains('$quotaCachePath.lock')) "Hook script implements lockfile check to avoid concurrent quota workers"
+    Assert-True ($hookScriptContent.Contains("CreateNoWindow = `$true")) "Hook script uses CreateNoWindow to prevent window popping"
+    Assert-True ($hookScriptContent.Contains("UseShellExecute = `$false")) "Hook script uses UseShellExecute = false to prevent window popping"
 
 } finally {
     if ($dummyHookProc -and -not $dummyHookProc.HasExited) {
@@ -1057,6 +1059,463 @@ try {
 } finally {
     $env:MULTIGRAVITY_TEST_SKIP_QUOTA_FETCH = $null
     Remove-Item -Recurse -Force $suite12TestBase -ErrorAction SilentlyContinue
+}
+
+# ==============================================================================
+# Suite 13: OpenRouter Model Discovery, Caching & Key Management
+# ==============================================================================
+Write-Host "`nSuite 13: OpenRouter Model Discovery, Caching & Key Management" -ForegroundColor Yellow
+
+$suite13TestBase = Join-Path $testRoot "suite13_openrouter"
+New-Item -ItemType Directory -Force -Path $suite13TestBase | Out-Null
+$env:MULTIGRAVITY_HOME = $suite13TestBase
+
+try {
+    # 1. Test cache path resolution
+    $cachePath = Get-OpenRouterModelsCachePath
+    $expectedPath = Join-Path $suite13TestBase ".openrouter_models_cache.json"
+    Assert-Equal $cachePath $expectedPath "Get-OpenRouterModelsCachePath returns expected cache path"
+
+    # 2. Test free model classification
+    $mockFreeModel1 = [PSCustomObject]@{ id = "meta-llama/llama-3.3-70b-instruct:free"; pricing = [PSCustomObject]@{ prompt = "0"; completion = "0" } }
+    $mockFreeModel2 = [PSCustomObject]@{ id = "google/gemini-2.0-flash-exp"; pricing = [PSCustomObject]@{ prompt = "0.00"; completion = "0.00" } }
+    $mockPaidModel = [PSCustomObject]@{ id = "openai/gpt-4o"; pricing = [PSCustomObject]@{ prompt = "0.000005"; completion = "0.000015" } }
+
+    Assert-True (Test-OpenRouterModelIsFree $mockFreeModel1) "Test-OpenRouterModelIsFree returns true for :free suffix"
+    Assert-True (Test-OpenRouterModelIsFree $mockFreeModel2) "Test-OpenRouterModelIsFree returns true for 0.00 pricing"
+    Assert-True (-not (Test-OpenRouterModelIsFree $mockPaidModel)) "Test-OpenRouterModelIsFree returns false for paid model"
+
+    # 3. Test caching and retrieval from local cache file
+    $mockModels = @(
+        [PSCustomObject]@{
+            id = "test/free-model:free"
+            name = "Test Free Model"
+            context_length = 131072
+            pricing = [PSCustomObject]@{ prompt = "0"; completion = "0" }
+        },
+        [PSCustomObject]@{
+            id = "test/paid-model"
+            name = "Test Paid Model"
+            context_length = 65536
+            pricing = [PSCustomObject]@{ prompt = "0.000003"; completion = "0.000015" }
+        }
+    )
+    $cachePayload = @{
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
+        count = 2
+        models = $mockModels
+    }
+    $cacheJson = $cachePayload | ConvertTo-Json -Depth 10
+    [System.IO.File]::WriteAllText($cachePath, $cacheJson, [System.Text.UTF8Encoding]::new($false))
+
+    $loadedModels = Get-OpenRouterModels
+    Assert-Equal (@($loadedModels).Count) 2 "Get-OpenRouterModels loads cached models count"
+
+    # 4. Test --free filter
+    $freeOnlyModels = Get-OpenRouterModels -FreeOnly
+    Assert-Equal (@($freeOnlyModels).Count) 1 "Get-OpenRouterModels -FreeOnly returns only 1 free model"
+    Assert-Equal $freeOnlyModels[0].id "test/free-model:free" "Free model ID matches"
+
+    # 5. Test search filter
+    $searchModels = Get-OpenRouterModels -Search "paid"
+    Assert-Equal (@($searchModels).Count) 1 "Get-OpenRouterModels -Search finds 1 match"
+    Assert-Equal $searchModels[0].id "test/paid-model" "Search model ID matches"
+
+    # 6. Test pricing calculation (Phase 3)
+    $freePricing = Get-OpenRouterModelPricingInfo -ModelId "test/free-model:free" -PromptCharLength 400
+    Assert-True $freePricing.IsFree "Get-OpenRouterModelPricingInfo marks free model as free"
+    Assert-Equal $freePricing.PromptPricePer1M 0.0 "Free model prompt $/1M is 0.0"
+    Assert-Equal $freePricing.EstimatedPromptCost 0.0 "Free model estimated prompt cost is 0.0"
+
+    $paidPricing = Get-OpenRouterModelPricingInfo -ModelId "test/paid-model" -PromptCharLength 400
+    Assert-True (-not $paidPricing.IsFree) "Get-OpenRouterModelPricingInfo marks paid model as not free"
+    Assert-Equal $paidPricing.PromptPricePer1M 3.0 "Paid model prompt $/1M matches calculated rate (0.000003 * 1M = 3.0)"
+    Assert-Equal $paidPricing.ComplPricePer1M 15.0 "Paid model compl $/1M matches calculated rate (0.000015 * 1M = 15.0)"
+    Assert-Equal $paidPricing.EstimatedTokens 100 "Estimated tokens for 400 chars is 100 (400 / 4)"
+    Assert-True ([Math]::Abs($paidPricing.EstimatedPromptCost - 0.0003) -lt 0.0000001) "Estimated prompt cost is 100 * 0.000003 = 0.0003"
+
+    # 7. Test confirmation guard (Phase 3)
+    $freeConfirm = Confirm-OpenRouterPaidModel -PricingInfo $freePricing
+    Assert-True $freeConfirm "Confirm-OpenRouterPaidModel auto-approves free models"
+    $paidAutoConfirm = Confirm-OpenRouterPaidModel -PricingInfo $paidPricing -Yes
+    Assert-True $paidAutoConfirm "Confirm-OpenRouterPaidModel approves paid models with -Yes flag"
+
+    # 8. Test Ensure-MultigravityApiPromptsDir (Phase 2)
+    $apiPromptsDir = Ensure-MultigravityApiPromptsDir
+    Assert-True (Test-Path $apiPromptsDir) "Ensure-MultigravityApiPromptsDir creates and returns valid directory"
+    Assert-True ($apiPromptsDir -like "*prompts\api*") "Ensure-MultigravityApiPromptsDir path contains prompts\api"
+
+    # 9. Test API key resolution from environment variable
+    $oldEnvKey = $env:OPENROUTER_API_KEY
+    try {
+        $env:OPENROUTER_API_KEY = "sk-or-v1-env-test-key"
+        $resolvedKey = Get-OpenRouterApiKey
+        Assert-Equal $resolvedKey "sk-or-v1-env-test-key" "Get-OpenRouterApiKey prioritizes environment variable"
+    } finally {
+        $env:OPENROUTER_API_KEY = $oldEnvKey
+    }
+
+    # 10. Test API key save and read via MultigravityCredVault
+    $testKeyVal = "sk-or-v1-vault-test-key-12345"
+    $saveSuccess = Set-OpenRouterApiKey $testKeyVal
+    Assert-True $saveSuccess "Set-OpenRouterApiKey successfully writes key"
+    $readVaultKey = [MultigravityCredVault]::ReadApiKey("multigravity:openrouter_api_key")
+    Assert-Equal $readVaultKey $testKeyVal "MultigravityCredVault reads back saved API key"
+
+    # 11. Test CLI execution of 'multigravity openrouter help'
+    $helpCliOut = (& $psCoreExe -NoProfile -ExecutionPolicy Bypass -File $MgScript openrouter help) | Out-String
+    Assert-Equal $LASTEXITCODE 0 "Executing 'multigravity openrouter help' exits with code 0"
+    Assert-True ($helpCliOut.Contains("OpenRouter API Chat & Prompt Shim")) "'multigravity openrouter help' output contains header"
+
+    # 12. Test CLI execution of 'multigravity openrouter models'
+    $modelsCliOut = (& $psCoreExe -NoProfile -ExecutionPolicy Bypass -File $MgScript openrouter models --free) | Out-String
+    Assert-Equal $LASTEXITCODE 0 "Executing 'multigravity openrouter models --free' exits with code 0"
+    Assert-True ($modelsCliOut.Contains("test/free-model:free")) "'multigravity openrouter models' displays cached free model"
+
+    # 13. Test alias routing 'multigravity or'
+    $orCliOut = (& $psCoreExe -NoProfile -ExecutionPolicy Bypass -File $MgScript or help) | Out-String
+    Assert-Equal $LASTEXITCODE 0 "Executing 'multigravity or help' exits with code 0"
+    Assert-True ($orCliOut.Contains("OpenRouter API Chat & Prompt Shim")) "Alias 'or' routes to OpenRouter command"
+
+} finally {
+    Remove-Item -Recurse -Force $suite13TestBase -ErrorAction SilentlyContinue
+    # Restore user's API key if overwritten during unit tests
+    Set-OpenRouterApiKey "OPENROUTER_API_KEY_PLACEHOLDER" | Out-Null
+}
+
+# ==============================================================================
+# Suite 14: OpenRouter to Antigravity Conversation DB Bridge
+# ==============================================================================
+Write-Host "`nSuite 14: OpenRouter to Antigravity Conversation DB Bridge" -ForegroundColor Yellow
+
+$suite14TestBase = Join-Path $testRoot "suite14_agy_bridge"
+New-Item -ItemType Directory -Force -Path $suite14TestBase | Out-Null
+$env:MULTIGRAVITY_HOME = $suite14TestBase
+
+$mockAgyDataDir = Join-Path $suite14TestBase "mock_antigravity_cli"
+New-Item -ItemType Directory -Force -Path $mockAgyDataDir | Out-Null
+$env:MULTIGRAVITY_TEST_ANTIGRAVITY_DIR = $mockAgyDataDir
+
+try {
+    # 1. Test Node executable resolution
+    $nodeExe = Find-NodeExecutable
+    Assert-True ($null -ne $nodeExe -and (Test-Path $nodeExe)) "Find-NodeExecutable discovers valid node.exe"
+
+    # 2. Test Antigravity data dir resolution
+    $agyDir = Get-AntigravityDataDir
+    Assert-Equal $agyDir $mockAgyDataDir "Get-AntigravityDataDir respects MULTIGRAVITY_TEST_ANTIGRAVITY_DIR override"
+
+    # 3. Test Workspace URI resolution
+    $mockWsDir = Join-Path $suite14TestBase "mock_workspace"
+    New-Item -ItemType Directory -Force -Path $mockWsDir | Out-Null
+    $wsInfo = Resolve-AntigravityWorkspaceInfo -WorkspacePath $mockWsDir -AntigravityDataDir $mockAgyDataDir
+    $expectedUri = "file:///" + ($mockWsDir -replace '\\', '/').TrimEnd('/')
+    Assert-Equal $wsInfo.WorkspaceUri $expectedUri "Resolve-AntigravityWorkspaceInfo builds canonical file:/// URI"
+    Assert-Equal $wsInfo.ProjectId "default-cli-project" "Initial workspace resolves to default-cli-project"
+
+    # 4. Test Single-Turn Export
+    $mockMessages = @(
+        [PSCustomObject]@{ role = "user"; content = "What is adiabatic quantum computation?" },
+        [PSCustomObject]@{ role = "assistant"; content = "Adiabatic quantum computation relies on the adiabatic theorem."; thinking = "Analyzing Hamiltonian evolution..." }
+    )
+    $exportRes = Export-OpenRouterChatToAntigravityConversation `
+        -Messages $mockMessages `
+        -ModelId "deepseek/deepseek-r1" `
+        -Title "Quantum Physics Q&A" `
+        -WorkspacePath $mockWsDir `
+        -AntigravityDataDir $mockAgyDataDir
+
+    Assert-True ($null -ne $exportRes) "Export-OpenRouterChatToAntigravityConversation returns export object"
+    Assert-Equal $exportRes.Title "Quantum Physics Q&A" "Export result maintains specified title"
+    Assert-True ($exportRes.ResumeCommand.StartsWith("agy resume ")) "ResumeCommand format matches 'agy resume <id>'"
+
+    # 5. Verify conversation_summaries.db
+    $summariesDbPath = Join-Path $mockAgyDataDir "conversation_summaries.db"
+    Assert-True (Test-Path $summariesDbPath) "conversation_summaries.db created in Antigravity data dir"
+
+    $verifySummariesJs = @"
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[1]);
+const row = db.prepare('SELECT * FROM conversation_summaries WHERE conversation_id = ?').get(process.argv[2]);
+db.close();
+process.stdout.write(JSON.stringify(row));
+"@
+    $sumRowJson = (& $nodeExe -e $verifySummariesJs $summariesDbPath $exportRes.ConversationId) | Out-String
+    $sumRow = $sumRowJson | ConvertFrom-Json
+    Assert-Equal $sumRow.conversation_id $exportRes.ConversationId "Summaries DB stores correct conversation_id"
+    Assert-Equal $sumRow.title "Quantum Physics Q&A" "Summaries DB stores correct title"
+    Assert-Equal $sumRow.step_count 2 "Summaries DB stores step_count = 2"
+
+    # 6. Verify conversations/<convId>.db and step records
+    $convDbPath = Join-Path $mockAgyDataDir "conversations\$($exportRes.ConversationId).db"
+    Assert-True (Test-Path $convDbPath) "conversations/<convId>.db file created"
+
+    $verifyConvJs = @"
+const { DatabaseSync } = require('node:sqlite');
+function extractField5(buf) {
+    let offset = 0;
+    while (offset < buf.length) {
+        let tag = 0, shift = 0;
+        while (offset < buf.length) {
+            const b = buf[offset++];
+            tag |= (b & 0x7f) << shift;
+            shift += 7;
+            if ((b & 0x80) === 0) break;
+        }
+        const fieldNum = tag >> 3;
+        const wireType = tag & 7;
+        if (wireType === 0) {
+            while (offset < buf.length && (buf[offset++] & 0x80) !== 0) {}
+        } else if (wireType === 2) {
+            let len = 0, lenShift = 0;
+            while (offset < buf.length) {
+                const b = buf[offset++];
+                len |= (b & 0x7f) << lenShift;
+                lenShift += 7;
+                if ((b & 0x80) === 0) break;
+            }
+            const data = buf.subarray(offset, offset + len);
+            offset += len;
+            if (fieldNum === 5) return data;
+        } else {
+            break;
+        }
+    }
+    return null;
+}
+const db = new DatabaseSync(process.argv[1]);
+const userVersion = db.prepare('PRAGMA user_version').get()['user_version'];
+const rawSteps = db.prepare('SELECT idx, step_type, status, metadata, step_payload FROM steps ORDER BY idx ASC').all();
+const steps = rawSteps.map(s => {
+    const metaBuf = Buffer.from(s.metadata || []);
+    const payloadBuf = Buffer.from(s.step_payload || []);
+    const field5 = extractField5(payloadBuf);
+    const metaMatchesField5 = (field5 !== null && Buffer.compare(metaBuf, field5) === 0);
+    return {
+        idx: s.idx,
+        step_type: s.step_type,
+        status: s.status,
+        meta_len: metaBuf.length,
+        payload_len: payloadBuf.length,
+        meta_matches_field5: metaMatchesField5
+    };
+});
+const traj = db.prepare('SELECT * FROM trajectory_meta').all();
+const trajBlob = db.prepare('SELECT id, length(data) as blob_len FROM trajectory_metadata_blob WHERE id = ?').get('main');
+db.close();
+process.stdout.write(JSON.stringify({ userVersion, steps, traj, trajBlob }));
+"@
+    $convDataJson = (& $nodeExe -e $verifyConvJs $convDbPath) | Out-String
+    $convData = $convDataJson | ConvertFrom-Json
+    Assert-Equal $convData.userVersion 1 "PRAGMA user_version is 1"
+    Assert-Equal (@($convData.steps).Count) 2 "Conversation DB has 2 step rows"
+    Assert-Equal $convData.steps[0].step_type 14 "Step 0 is USER_INPUT (type 14)"
+    Assert-True ($convData.steps[0].meta_len -gt 20) "Step 0 metadata is populated"
+    Assert-True ($convData.steps[0].meta_matches_field5) "Step 0 metadata matches Field 5 of step_payload"
+    Assert-True ($convData.steps[0].payload_len -gt 50) "Step 0 step_payload contains binary Protobuf buffer"
+    Assert-Equal $convData.steps[1].step_type 15 "Step 1 is PLANNER_RESPONSE (type 15)"
+    Assert-True ($convData.steps[1].meta_len -gt 20) "Step 1 metadata is populated"
+    Assert-True ($convData.steps[1].meta_matches_field5) "Step 1 metadata matches Field 5 of step_payload"
+    Assert-True ($convData.steps[1].payload_len -gt 50) "Step 1 step_payload contains binary Protobuf buffer"
+    Assert-Equal (@($convData.traj).Count) 1 "Trajectory meta row created"
+    Assert-True ($null -ne $convData.trajBlob) "trajectory_metadata_blob 'main' row created"
+    Assert-True ($convData.trajBlob.blob_len -gt 50) "trajectory_metadata_blob contains binary Protobuf buffer"
+
+    # 7. Verify brain transcript logs and UI resume chunks
+    $transcriptPath = Join-Path $mockAgyDataDir "brain\$($exportRes.ConversationId)\.system_generated\logs\transcript.jsonl"
+    Assert-True (Test-Path $transcriptPath) "Brain transcript.jsonl log exists"
+    $tLines = [System.IO.File]::ReadAllLines($transcriptPath)
+    Assert-Equal (@($tLines).Count) 2 "transcript.jsonl contains 2 log entries"
+
+    $chunkTPath = Join-Path $mockAgyDataDir "brain\$($exportRes.ConversationId)\.system_generated\logs\chunks\transcript\00000000.jsonl"
+    Assert-True (Test-Path $chunkTPath) "Brain chunks/transcript/00000000.jsonl exists"
+    $chunkTFPath = Join-Path $mockAgyDataDir "brain\$($exportRes.ConversationId)\.system_generated\logs\chunks\transcript_full\00000000.jsonl"
+    Assert-True (Test-Path $chunkTFPath) "Brain chunks/transcript_full/00000000.jsonl exists"
+
+    # 8. Verify UI annotations & history.jsonl
+    $annoPath = Join-Path $mockAgyDataDir "annotations\$($exportRes.ConversationId).pbtxt"
+    Assert-True (Test-Path $annoPath) "Annotation pbtxt file exists"
+    $annoContent = [System.IO.File]::ReadAllText($annoPath)
+    Assert-True ($annoContent.Contains('title:"Quantum Physics Q&A"')) "Annotation file contains title: prefix"
+
+    $histPath = Join-Path $mockAgyDataDir "history.jsonl"
+    Assert-True (Test-Path $histPath) "history.jsonl exists in Antigravity data dir"
+    $histContent = [System.IO.File]::ReadAllText($histPath)
+    Assert-True ($histContent.Contains($exportRes.ConversationId)) "history.jsonl contains conversationId"
+    Assert-True ($histContent.Contains("Quantum Physics Q&A")) "history.jsonl contains display title"
+
+    # 9. Test Multi-Turn Export
+    $multiTurnMessages = @(
+        [PSCustomObject]@{ role = "system"; content = "You are a compiler expert." },
+        [PSCustomObject]@{ role = "user"; content = "Explain SSA form in LLVM" },
+        [PSCustomObject]@{ role = "assistant"; content = "Static Single Assignment (SSA) requires every variable to be assigned exactly once." },
+        [PSCustomObject]@{ role = "user"; content = "What are Phi nodes?" },
+        [PSCustomObject]@{ role = "assistant"; content = "Phi nodes select values based on predecessor basic blocks in the control flow graph." }
+    )
+    $multiExportRes = Export-OpenRouterChatToAntigravityConversation `
+        -Messages $multiTurnMessages `
+        -ModelId "meta-llama/llama-3.3-70b-instruct:free" `
+        -WorkspacePath $mockWsDir `
+        -AntigravityDataDir $mockAgyDataDir
+
+    $multiTranscriptPath = Join-Path $mockAgyDataDir "brain\$($multiExportRes.ConversationId)\.system_generated\logs\transcript.jsonl"
+    $multiTLines = [System.IO.File]::ReadAllLines($multiTranscriptPath)
+    Assert-Equal (@($multiTLines).Count) 4 "Multi-turn transcript.jsonl contains 4 dialog steps (skipping system prompt)"
+
+    $multiChunkPath = Join-Path $mockAgyDataDir "brain\$($multiExportRes.ConversationId)\.system_generated\logs\chunks\transcript\00000000.jsonl"
+    Assert-True (Test-Path $multiChunkPath) "Multi-turn chunks/transcript/00000000.jsonl exists"
+
+    $multiConvDbPath = Join-Path $mockAgyDataDir "conversations\$($multiExportRes.ConversationId).db"
+    Assert-True (Test-Path $multiConvDbPath) "Multi-turn conversation DB exists"
+    $multiConvDataJson = (& $nodeExe -e $verifyConvJs $multiConvDbPath) | Out-String
+    $multiConvData = $multiConvDataJson | ConvertFrom-Json
+    Assert-Equal $multiConvData.userVersion 1 "Multi-turn PRAGMA user_version is 1"
+    Assert-Equal (@($multiConvData.steps).Count) 4 "Multi-turn conversation DB has 4 step rows"
+    for ($si = 0; $si -lt 4; $si++) {
+        Assert-True ($multiConvData.steps[$si].meta_len -gt 20) "Multi-turn step $si metadata is populated"
+        Assert-True ($multiConvData.steps[$si].meta_matches_field5) "Multi-turn step $si metadata matches Field 5 of step_payload"
+    }
+
+    # 10. Test Resolve-AntigravityWorkspaceInfo with project_id in conversation_summaries.db
+    $resolvedWithProj = Resolve-AntigravityWorkspaceInfo -WorkspacePath $mockWsDir -AntigravityDataDir $mockAgyDataDir
+    Assert-Equal $resolvedWithProj.ProjectId "default-cli-project" "Workspace resolves ProjectId from conversation summaries"
+
+    # 11. Test -Project resolution with raw GUID
+    $testGuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    $resolvedGuid = Resolve-AntigravityWorkspaceInfo -WorkspacePath $mockWsDir -Project $testGuid -AntigravityDataDir $mockAgyDataDir
+    Assert-Equal $resolvedGuid.ProjectId $testGuid "Resolve-AntigravityWorkspaceInfo resolves raw project GUID"
+
+    # 12. Test -Project resolution with config/projects mock file
+    $mockConfigProjectsDir = Join-Path (Split-Path $mockAgyDataDir -Parent) "config\projects"
+    New-Item -ItemType Directory -Force -Path $mockConfigProjectsDir | Out-Null
+    $mockProjJsonPath = Join-Path $mockConfigProjectsDir "named-project.json"
+    $mockProjId = "99999999-8888-7777-6666-555555555555"
+    $mockProjContent = @"
+{
+  "id": "$mockProjId",
+  "name": "named-project",
+  "projectResources": {
+    "resources": [
+      {
+        "folderUri": "file:///C:/mock/project/path"
+      }
+    ]
+  }
+}
+"@
+    Set-Content -Path $mockProjJsonPath -Value $mockProjContent
+
+    $resolvedNamedProj = Resolve-AntigravityWorkspaceInfo -Project "named-project" -AntigravityDataDir $mockAgyDataDir
+    Assert-Equal $resolvedNamedProj.ProjectId $mockProjId "Resolve-AntigravityWorkspaceInfo resolves project ID from config/projects"
+    Assert-Equal $resolvedNamedProj.WorkspaceUri "file:///C:/mock/project/path" "Resolve-AntigravityWorkspaceInfo resolves workspace URI from config/projects"
+
+} finally {
+    $env:MULTIGRAVITY_TEST_ANTIGRAVITY_DIR = $null
+    Remove-Item -Recurse -Force $suite14TestBase -ErrorAction SilentlyContinue
+}
+
+# ── Test Suite 15: Antigravity Conversation Management & Artifact Purging ──
+Write-Host ""
+Write-Host "Suite 15: Conversation Management, Purge & Ghost Pruning"
+
+$suite15TestBase = Join-Path ([System.IO.Path]::GetTempPath()) "suite15_agy_conv_$PID"
+$mockAgyDir15 = Join-Path $suite15TestBase "antigravity-cli"
+$mockWsDir15 = Join-Path $suite15TestBase "mock_workspace"
+
+New-Item -ItemType Directory -Force -Path $mockAgyDir15 | Out-Null
+New-Item -ItemType Directory -Force -Path $mockWsDir15 | Out-Null
+
+$env:MULTIGRAVITY_TEST_ANTIGRAVITY_DIR = $mockAgyDir15
+
+try {
+    # 1. Export two test conversations into mock Antigravity data dir
+    $conv1 = Export-OpenRouterChatToAntigravityConversation `
+        -Messages @([PSCustomObject]@{ role = "user"; content = "Test Conv 1" }) `
+        -ModelId "openrouter/free" `
+        -Title "Active Conversation One" `
+        -WorkspacePath $mockWsDir15 `
+        -AntigravityDataDir $mockAgyDir15
+
+    $conv2 = Export-OpenRouterChatToAntigravityConversation `
+        -Messages @([PSCustomObject]@{ role = "user"; content = "Test Conv 2" }) `
+        -ModelId "openrouter/free" `
+        -Title "Ghost Candidate Two" `
+        -WorkspacePath $mockWsDir15 `
+        -AntigravityDataDir $mockAgyDir15
+
+    $id1 = $conv1.ConversationId
+    $id2 = $conv2.ConversationId
+
+    Assert-True (Test-Path (Join-Path $mockAgyDir15 "conversations\$id1.db")) "Conv 1 db exists before purge"
+    Assert-True (Test-Path (Join-Path $mockAgyDir15 "brain\$id1")) "Conv 1 brain dir exists before purge"
+    Assert-True (Test-Path (Join-Path $mockAgyDir15 "annotations\$id1.pbtxt")) "Conv 1 annotation exists before purge"
+
+    # 2. Test Remove-AntigravityConversation on conv 1
+    $purgedItems = Remove-AntigravityConversation -ConversationId $id1 -AntigravityDataDir $mockAgyDir15
+    Assert-True ($purgedItems.Count -ge 4) "Remove-AntigravityConversation purged all on-disk artifacts"
+    Assert-True (-not (Test-Path (Join-Path $mockAgyDir15 "conversations\$id1.db"))) "Conv 1 db removed from disk"
+    Assert-True (-not (Test-Path (Join-Path $mockAgyDir15 "brain\$id1"))) "Conv 1 brain dir removed from disk"
+    Assert-True (-not (Test-Path (Join-Path $mockAgyDir15 "annotations\$id1.pbtxt"))) "Conv 1 annotation removed from disk"
+
+    # Verify removed from conversation_summaries.db
+    $nodeExe15 = Find-NodeExecutable
+    $checkSummaryJs = @"
+const { DatabaseSync } = require('node:sqlite');
+const path = require('node:path');
+const db = new DatabaseSync(path.join('$($mockAgyDir15 -replace '\\', '/')', 'conversation_summaries.db'));
+const row1 = db.prepare('SELECT conversation_id FROM conversation_summaries WHERE conversation_id = ?').get('$id1');
+const row2 = db.prepare('SELECT conversation_id FROM conversation_summaries WHERE conversation_id = ?').get('$id2');
+db.close();
+process.stdout.write(JSON.stringify({ row1: !!row1, row2: !!row2 }));
+"@
+    $checkSummaryRes = (& $nodeExe15 -e $checkSummaryJs) | ConvertFrom-Json
+    Assert-True (-not $checkSummaryRes.row1) "Conv 1 removed from conversation_summaries.db"
+    Assert-True ($checkSummaryRes.row2) "Conv 2 remains in conversation_summaries.db"
+
+    # Verify removed from history.jsonl
+    $hist15Path = Join-Path $mockAgyDir15 "history.jsonl"
+    $hist15Content = [System.IO.File]::ReadAllText($hist15Path)
+    Assert-True (-not ($hist15Content.Contains($id1))) "Conv 1 removed from history.jsonl"
+    Assert-True ($hist15Content.Contains($id2)) "Conv 2 preserved in history.jsonl"
+
+    # 3. Test Remove-AntigravityConversation idempotency on non-existent ID
+    $emptyPurge = Remove-AntigravityConversation -ConversationId "00000000-0000-0000-0000-000000000000" -AntigravityDataDir $mockAgyDir15
+    Assert-Equal (@($emptyPurge).Count) 0 "Remove-AntigravityConversation on non-existent ID returns empty list gracefully"
+
+    # 4. Test Ghost Pruning: simulate ghost row with 0001-01-01 timestamp
+    $ghostId = [System.Guid]::NewGuid().ToString()
+    $makeGhostJs = @"
+const { DatabaseSync } = require('node:sqlite');
+const path = require('node:path');
+const db = new DatabaseSync(path.join('$($mockAgyDir15 -replace '\\', '/')', 'conversation_summaries.db'));
+db.prepare('INSERT INTO conversation_summaries (conversation_id, title, last_modified_time, workspace_uris, project_id, last_user_input_time) VALUES (?, ?, ?, ?, ?, ?)').run('$ghostId', '', '0001-01-01 00:00:00+00:00', '', '', '0001-01-01 00:00:00+00:00');
+db.close();
+"@
+    & $nodeExe15 -e $makeGhostJs
+
+    # Also create dummy .db and brain dir for the ghost
+    New-Item -ItemType File -Force -Path (Join-Path $mockAgyDir15 "conversations\$ghostId.db") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $mockAgyDir15 "brain\$ghostId") | Out-Null
+
+    # Execute multigravity conv prune
+    $pruneOut = (& $MgScript conv prune 6>&1) | Out-String
+    Assert-True ($pruneOut.Contains("Found 1 orphaned ghost conversation")) "conv prune detects orphaned ghost conversation"
+    Assert-True (-not (Test-Path (Join-Path $mockAgyDir15 "conversations\$ghostId.db"))) "Ghost conversation db deleted by prune"
+    Assert-True (-not (Test-Path (Join-Path $mockAgyDir15 "brain\$ghostId"))) "Ghost brain dir deleted by prune"
+
+    # 5. Test multigravity conv list
+    $listOut = (& $MgScript conv list 6>&1) | Out-String
+    Assert-True ($listOut.Contains("Recent Antigravity Conversations")) "conv list renders table header"
+    Assert-True ($listOut.Contains("Ghost Candidate Two")) "conv list displays remaining conversation"
+
+    # 6. Test multigravity conv purge <id>
+    $purgeCliOut = (& $MgScript conv purge $id2 6>&1) | Out-String
+    Assert-True ($purgeCliOut.Contains("permanently purged")) "conv purge CLI command displays success confirmation"
+    Assert-True (-not (Test-Path (Join-Path $mockAgyDir15 "conversations\$id2.db"))) "Conv 2 db deleted via CLI purge"
+
+} finally {
+    $env:MULTIGRAVITY_TEST_ANTIGRAVITY_DIR = $null
+    Remove-Item -Recurse -Force $suite15TestBase -ErrorAction SilentlyContinue
 }
 
 # ── Cleanup Test Environment Variables ──

@@ -11,6 +11,27 @@ param (
     [Parameter(Mandatory = $false, DontShow = $true)]
     [string]$p,
 
+    [Parameter(Mandatory = $false, DontShow = $true)]
+    [string]$w,
+
+    [Parameter(Mandatory = $false, DontShow = $true)]
+    [string]$t,
+
+    [Parameter(Mandatory = $false, DontShow = $true)]
+    [string]$m,
+
+    [Parameter(Mandatory = $false, DontShow = $true)]
+    [string]$s,
+
+    [Parameter(Mandatory = $false, DontShow = $true)]
+    [string]$f,
+
+    [Parameter(Mandatory = $false, DontShow = $true)]
+    [switch]$r,
+
+    [Parameter(Mandatory = $false, DontShow = $true)]
+    [switch]$q,
+
     [Parameter(ValueFromPipeline = $true)]
     [psobject]$InputObject,
 
@@ -151,6 +172,10 @@ function Get-SystemGeminiDir {
     return "$ROOT_USERPROFILE\.gemini"
 }
 
+try {
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+} catch {}
+
 if (-not ([System.Management.Automation.PSTypeName]'MultigravityCredVault').Type) {
     $refAssemblies = @("System.Security")
     if ($PSEdition -eq "Core" -or $IsCoreCLR) {
@@ -247,6 +272,40 @@ public class MultigravityCredVault {
 
     public static bool RemoveCredential(string target) {
         return CredDelete(target, 1, 0);
+    }
+
+    public static bool SaveApiKey(string target, string apiKey) {
+        if (string.IsNullOrEmpty(apiKey)) return false;
+        try {
+            byte[] bytes = System.Text.Encoding.Unicode.GetBytes(apiKey);
+            IntPtr blobPtr = Marshal.AllocHGlobal(bytes.Length);
+            Marshal.Copy(bytes, 0, blobPtr, bytes.Length);
+
+            CREDENTIAL cred = new CREDENTIAL();
+            cred.Type = 1; // CRED_TYPE_GENERIC
+            cred.TargetName = target;
+            cred.UserName = "apikey";
+            cred.CredentialBlobSize = (uint)bytes.Length;
+            cred.CredentialBlob = blobPtr;
+            cred.Persist = 2; // CRED_PERSIST_LOCAL_MACHINE
+
+            bool result = CredWrite(ref cred, 0);
+            Marshal.FreeHGlobal(blobPtr);
+            return result;
+        } catch {
+            return false;
+        }
+    }
+
+    public static string ReadApiKey(string target) {
+        IntPtr ptr;
+        if (CredRead(target, 1, 0, out ptr)) {
+            CREDENTIAL cred = (CREDENTIAL)Marshal.PtrToStructure(ptr, typeof(CREDENTIAL));
+            string key = Marshal.PtrToStringUni(cred.CredentialBlob, (int)cred.CredentialBlobSize / 2);
+            CredFree(ptr);
+            return key;
+        }
+        return null;
     }
 
     public static bool PayloadsEqual(string base64BlobA, string base64BlobB) {
@@ -647,7 +706,13 @@ try {
                     $psExe = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh.exe" } else { "powershell.exe" }
                     # Background quota update worker for active profile: Update-ProfileQuotaCache via CLI dispatcher
                     $workerCmd = "& { try { & '$mgScriptPath' quota '$instanceProfile' --refresh *>`$null } finally { if (Test-Path '$lockPath') { Remove-Item '$lockPath' -Force -ErrorAction SilentlyContinue } } }"
-                    Start-Process -FilePath $psExe -ArgumentList @("-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-Command", $workerCmd) -ErrorAction SilentlyContinue | Out-Null
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = $psExe
+                    $psi.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$workerCmd`""
+                    $psi.CreateNoWindow = $true
+                    $psi.UseShellExecute = $false
+                    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+                    [System.Diagnostics.Process]::Start($psi) | Out-Null
                 }
             } catch {}
         }
@@ -927,7 +992,7 @@ function Invoke-WithVaultMutex {
         }
     }
 
-    $timeoutMs = if ($env:MULTIGRAVITY_MUTEX_TIMEOUT_MS) { [int]$env:MULTIGRAVITY_MUTEX_TIMEOUT_MS } else { 10000 }
+    $timeoutMs = if ($env:MULTIGRAVITY_MUTEX_TIMEOUT_MS) { [int]$env:MULTIGRAVITY_MUTEX_TIMEOUT_MS } else { 25000 }
     $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $mutexName = "Local\Multigravity_Vault_Mutex_$userSid"
     
@@ -1696,89 +1761,93 @@ function Restore-PostLaunchCredential {
     $tag = if ($isGlobal) { "Global profile '$PROFILE'" } else { "Profile '$PROFILE'" }
     $credPath = Get-ProfileCredentialPath $PROFILE
 
-    Invoke-WithVaultMutex {
-        $reg = Get-ActiveInstancesRegistry
+    try {
+        Invoke-WithVaultMutex {
+            $reg = Get-ActiveInstancesRegistry
 
-        # 1. Remove this instance from registry
-        if ($ProcessId -gt 0) {
-            $reg.instances = @($reg.instances | Where-Object { $_.pid -ne $ProcessId })
-            Save-ActiveInstancesRegistry $reg
-        }
+            # 1. Remove this instance from registry
+            if ($ProcessId -gt 0) {
+                $reg.instances = @($reg.instances | Where-Object { $_.pid -ne $ProcessId })
+                Save-ActiveInstancesRegistry $reg
+            }
 
-        # 2. Vault Ownership Verification on Exit:
-        # ONLY the active vault profile may inspect vault tokens!
-        if ($reg.active_vault_profile -eq $PROFILE) {
-            $user = [string]::Empty
-            $blob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$user)
-            if ($blob) {
-                $shouldSave = $false
-                if (-not $HadSavedCred -and -not (Test-CredentialFileValid $credPath)) {
-                    # Initial login save for fresh profile
-                    $shouldSave = $true
-                } elseif ($HadSavedCred -and (Test-Path $credPath)) {
-                    try {
-                        $existing = Get-Content $credPath -Raw | ConvertFrom-Json
-                        # ONLY update if username matches AND token payload has changed
-                        if ($existing.userName -eq $user -and -not [MultigravityCredVault]::PayloadsEqual($existing.blob, $blob)) {
-                            $shouldSave = $true
-                        }
-                    } catch {}
-                }
+            # 2. Vault Ownership Verification on Exit:
+            # ONLY the active vault profile may inspect vault tokens!
+            if ($reg.active_vault_profile -eq $PROFILE) {
+                $user = [string]::Empty
+                $blob = [MultigravityCredVault]::ExportCredential($credTarget, [ref]$user)
+                if ($blob) {
+                    $shouldSave = $false
+                    if (-not $HadSavedCred -and -not (Test-CredentialFileValid $credPath)) {
+                        # Initial login save for fresh profile
+                        $shouldSave = $true
+                    } elseif ($HadSavedCred -and (Test-Path $credPath)) {
+                        try {
+                            $existing = Get-Content $credPath -Raw | ConvertFrom-Json
+                            # ONLY update if username matches AND token payload has changed
+                            if ($existing.userName -eq $user -and -not [MultigravityCredVault]::PayloadsEqual($existing.blob, $blob)) {
+                                $shouldSave = $true
+                            }
+                        } catch {}
+                    }
 
-                if ($shouldSave) {
-                    $tmpTarget = "$credPath.tmp"
-                    $data = @{
-                        userName = $user
-                        blob     = $blob
-                        updated  = (Get-Date).ToString("o")
-                    } | ConvertTo-Json
-                    [System.IO.File]::WriteAllText($tmpTarget, $data, [System.Text.UTF8Encoding]::new($false))
-                    if (Test-CredentialFileValid $tmpTarget) {
-                        Move-Item -Path $tmpTarget -Destination $credPath -Force
-                        if (-not $HadSavedCred) {
-                            Write-Host "Saved initial credential for $tag"
+                    if ($shouldSave) {
+                        $tmpTarget = "$credPath.tmp"
+                        $data = @{
+                            userName = $user
+                            blob     = $blob
+                            updated  = (Get-Date).ToString("o")
+                        } | ConvertTo-Json
+                        [System.IO.File]::WriteAllText($tmpTarget, $data, [System.Text.UTF8Encoding]::new($false))
+                        if (Test-CredentialFileValid $tmpTarget) {
+                            Move-Item -Path $tmpTarget -Destination $credPath -Force
+                            if (-not $HadSavedCred) {
+                                Write-Host "Saved initial credential for $tag"
+                            } else {
+                                Write-Host "Updated refreshed credentials for $tag"
+                            }
                         } else {
-                            Write-Host "Updated refreshed credentials for $tag"
+                            Remove-Item $tmpTarget -Force -ErrorAction SilentlyContinue
                         }
                     } else {
-                        Remove-Item $tmpTarget -Force -ErrorAction SilentlyContinue
+                        Write-Host "$tag credential file is valid; skipping resave on exit."
                     }
                 } else {
-                    Write-Host "$tag credential file is valid; skipping resave on exit."
+                    Write-Host "$tag had no credentials in vault on exit."
                 }
-            } else {
-                Write-Host "$tag had no credentials in vault on exit."
-            }
 
-            # 3. If no other instances of this profile are running, restore Global credentials at rest
-            $remainingProfileInstances = @($reg.instances | Where-Object { $_.profile -eq $PROFILE })
-            if ($remainingProfileInstances.Count -eq 0) {
-                $env:MULTIGRAVITY_ACTIVE_PROFILE = $null
-                $env:MULTIGRAVITY_ACTIVE_PID = $null
-                $reg.active_vault_profile = $null
-                Restore-GlobalCredential
-                $reg = Get-ActiveInstancesRegistry
-            }
-        } else {
-            # Vault currently holds another profile or global resting state
-            if (Test-CredentialFileValid $credPath) {
-                Write-Host "$tag credential file is valid; skipping resave on exit."
-            } else {
-                Write-Host "$tag was displaced by '$($reg.active_vault_profile)'; skipping credential save on exit."
-            }
-
-            if (-not $reg.instances -or @($reg.instances).Count -eq 0) {
-                $env:MULTIGRAVITY_ACTIVE_PROFILE = $null
-                $env:MULTIGRAVITY_ACTIVE_PID = $null
-                if ($reg.active_vault_profile -ne $globalProfile) {
+                # 3. If no other instances of this profile are running, restore Global credentials at rest
+                $remainingProfileInstances = @($reg.instances | Where-Object { $_.profile -eq $PROFILE })
+                if ($remainingProfileInstances.Count -eq 0) {
+                    $env:MULTIGRAVITY_ACTIVE_PROFILE = $null
+                    $env:MULTIGRAVITY_ACTIVE_PID = $null
                     $reg.active_vault_profile = $null
                     Restore-GlobalCredential
                     $reg = Get-ActiveInstancesRegistry
                 }
-            }
-        }
+            } else {
+                # Vault currently holds another profile or global resting state
+                if (Test-CredentialFileValid $credPath) {
+                    Write-Host "$tag credential file is valid; skipping resave on exit."
+                } else {
+                    Write-Host "$tag was displaced by '$($reg.active_vault_profile)'; skipping credential save on exit."
+                }
 
-        Save-ActiveInstancesRegistry $reg
+                if (-not $reg.instances -or @($reg.instances).Count -eq 0) {
+                    $env:MULTIGRAVITY_ACTIVE_PROFILE = $null
+                    $env:MULTIGRAVITY_ACTIVE_PID = $null
+                    if ($reg.active_vault_profile -ne $globalProfile) {
+                        $reg.active_vault_profile = $null
+                        Restore-GlobalCredential
+                        $reg = Get-ActiveInstancesRegistry
+                    }
+                }
+            }
+
+            Save-ActiveInstancesRegistry $reg
+        }
+    } catch {
+        Write-Warning "Failed to acquire vault lock during exit cleanup: $_"
     }
 }
 
@@ -1791,6 +1860,31 @@ function Get-ProfileQuotaCachePath {
     } else {
         $pDir = Join-Path $BASE $profileName
         return (Join-Path $pDir ".quota_cache.json")
+    }
+}
+
+function Invoke-AgyUsageHeadless {
+    param([string]$CliAppPath)
+    if ([string]::IsNullOrEmpty($CliAppPath) -or (-not (Test-Path $CliAppPath))) {
+        return $null
+    }
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $CliAppPath
+        $psi.Arguments = '-p "/usage" --output-format json'
+        $psi.CreateNoWindow = $true
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        if (-not $proc) { return $null }
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $proc.WaitForExit(15000)
+        return $stdout
+    } catch {
+        return $null
     }
 }
 
@@ -1816,7 +1910,7 @@ function Update-ProfileQuotaCache {
             $reg = Get-ActiveInstancesRegistry
 
             if ($reg.active_vault_profile -and ($reg.active_vault_profile -eq $ProfileName)) {
-                $res = & $CLI_APP -p "/usage" --output-format json 2>$null
+                $res = Invoke-AgyUsageHeadless -CliAppPath $CLI_APP
                 return ($res | Out-String)
             } else {
                 if (-not (Test-CredentialFileValid $credPath)) { return $null }
@@ -1830,7 +1924,7 @@ function Update-ProfileQuotaCache {
 
                 try {
                     [MultigravityCredVault]::ImportCredential($credTarget, $jsonCred.userName, $jsonCred.blob) | Out-Null
-                    $res = & $CLI_APP -p "/usage" --output-format json 2>$null
+                    $res = Invoke-AgyUsageHeadless -CliAppPath $CLI_APP
                     return ($res | Out-String)
                 } finally {
                     if ($curBlob) {
@@ -1923,6 +2017,12 @@ function Update-ProfileQuotaCache {
         return $summary
     } catch {
         return "-"
+    } finally {
+        $cachePath = Get-ProfileQuotaCachePath $ProfileName
+        $lockPath = "$cachePath.lock"
+        if (Test-Path $lockPath) {
+            Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -2071,6 +2171,8 @@ function Write-Usage {
     Write-Host "  shortcuts [profile|restore]  Create or restore Start Menu shortcuts"
     Write-Host "  hooks [install|status|uninstall] Manage conversation tracking lifecycle hooks"
     Write-Host "  completion                  Show setup instructions for shell completion"
+    Write-Host "  openrouter [models|key]     OpenRouter 3rd-party API prompt & chat shim (alias: or, shim)"
+    Write-Host "  conv [list|purge|prune]     Manage Antigravity conversations (alias: conversation)"
     Write-Host "  cli <name> [args]           Launch Antigravity CLI (agy) with the given profile"
     Write-Host "  agy <name> [args]           Alias for cli"
     Write-Host "  app <name> [args]           Launch Antigravity Desktop UI with the given profile"
@@ -4190,6 +4292,1810 @@ function Invoke-ImportProfile {
     }
     Write-Host "Imported profile '$name'"
 }
+
+function Get-OpenRouterApiKey {
+    if ($env:OPENROUTER_API_KEY -and (-not [string]::IsNullOrWhiteSpace($env:OPENROUTER_API_KEY))) {
+        return $env:OPENROUTER_API_KEY.Trim()
+    }
+    try {
+        $saved = [MultigravityCredVault]::ReadApiKey("multigravity:openrouter_api_key")
+        if (-not $saved) {
+            $saved = [MultigravityCredVault]::ReadApiKey("multigravity:openrouter")
+        }
+        if ($saved -and (-not [string]::IsNullOrWhiteSpace($saved))) {
+            return $saved.Trim()
+        }
+    } catch {}
+    return $null
+}
+
+function Set-OpenRouterApiKey {
+    param([Parameter(Mandatory=$true)][string]$Key)
+    if ([string]::IsNullOrWhiteSpace($Key)) {
+        Write-Error "Error: API key cannot be empty."
+        return $false
+    }
+    $cleanKey = $Key.Trim()
+    $saved = [MultigravityCredVault]::SaveApiKey("multigravity:openrouter_api_key", $cleanKey)
+    if ($saved) {
+        Write-Host "[OK] OpenRouter API key saved securely to Windows Credential Manager." -ForegroundColor Green
+        return $true
+    } else {
+        Write-Error "Error: Failed to save API key to Windows Credential Manager."
+        return $false
+    }
+}
+
+function Remove-OpenRouterApiKey {
+    [MultigravityCredVault]::RemoveCredential("multigravity:openrouter_api_key") | Out-Null
+    [MultigravityCredVault]::RemoveCredential("multigravity:openrouter") | Out-Null
+    Write-Host "[OK] OpenRouter API key removed from Windows Credential Manager." -ForegroundColor Green
+}
+
+function Test-OpenRouterApiKey {
+    param([string]$Key = $null)
+    $apiKey = if ($Key) { $Key } else { Get-OpenRouterApiKey }
+    if (-not $apiKey) {
+        Write-Host "[!] No OpenRouter API key configured." -ForegroundColor Yellow
+        Write-Host "    Set with: multigravity openrouter key set <api-key>"
+        Write-Host "    Or set environment variable: `$env:OPENROUTER_API_KEY = '<api-key>'"
+        return $false
+    }
+
+    Write-Host "Testing OpenRouter API key authentication..."
+    try {
+        $headers = @{
+            "Authorization" = "Bearer $apiKey"
+        }
+        $res = Invoke-RestMethod -Uri "https://openrouter.ai/api/v1/auth/key" -Headers $headers -Method Get -TimeoutSec 10 -ErrorAction Stop
+        if ($res -and $res.data) {
+            $d = $res.data
+            Write-Host "[OK] Authentication Successful!" -ForegroundColor Green
+            if ($d.label) { Write-Host "  Label:         $($d.label)" }
+            if ($null -ne $d.usage) { Write-Host "  Usage:         `$$($d.usage)" }
+            if ($null -ne $d.limit) { Write-Host "  Limit:         `$$($d.limit)" }
+            if ($null -ne $d.is_free_tier) { Write-Host "  Free Tier:     $($d.is_free_tier)" }
+            return $true
+        } else {
+            Write-Host "[OK] Authentication Successful (Valid API Key)." -ForegroundColor Green
+            return $true
+        }
+    } catch {
+        $msg = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $msg = "$msg - $($_.ErrorDetails.Message)"
+        }
+        Write-Error "Authentication Failed: $msg"
+        return $false
+    }
+}
+
+function Get-OpenRouterModelsCachePath {
+    $BASE = Get-BaseDir
+    return (Join-Path $BASE ".openrouter_models_cache.json")
+}
+
+function Test-OpenRouterModelIsFree {
+    param($Model)
+    if (-not $Model) { return $false }
+    if ($Model.id -and $Model.id -match ':free$') { return $true }
+    if ($Model.pricing) {
+        $pPrompt = [string]$Model.pricing.prompt
+        $pCompl = [string]$Model.pricing.completion
+        if (($pPrompt -eq "0" -or $pPrompt -eq "0.0" -or $pPrompt -eq "0.00") -and
+            ($pCompl -eq "0" -or $pCompl -eq "0.0" -or $pCompl -eq "0.00")) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-OpenRouterModels {
+    param(
+        [switch]$Refresh,
+        [switch]$FreeOnly,
+        [string]$Search
+    )
+
+    $cachePath = Get-OpenRouterModelsCachePath
+    $modelsData = $null
+    $ttlSeconds = 21600 # 6 hours
+
+    if ((-not $Refresh) -and (Test-Path $cachePath)) {
+        try {
+            $cacheContent = Get-Content -Path $cachePath -Raw -Encoding UTF8 -ErrorAction Stop
+            $cached = $cacheContent | ConvertFrom-Json -ErrorAction Stop
+            if ($cached -and $cached.timestamp -and $cached.models) {
+                $cachedUtc = ([datetime]$cached.timestamp).ToUniversalTime()
+                $nowUtc    = (Get-Date).ToUniversalTime()
+                $diffSec   = [Math]::Abs(($nowUtc - $cachedUtc).TotalSeconds)
+                if ($diffSec -lt $ttlSeconds) {
+                    $modelsData = @($cached.models)
+                }
+            }
+        } catch {}
+    }
+
+    if (-not $modelsData) {
+        try {
+            $res = Invoke-RestMethod -Uri "https://openrouter.ai/api/v1/models" -Method Get -TimeoutSec 15 -ErrorAction Stop
+            if ($res -and $res.data) {
+                $modelsData = @($res.data)
+                $cachePayload = @{
+                    timestamp = (Get-Date).ToUniversalTime().ToString("o")
+                    count     = $modelsData.Count
+                    models    = $modelsData
+                }
+                $json = $cachePayload | ConvertTo-Json -Depth 10
+                $baseDir = Split-Path $cachePath -Parent
+                if (-not (Test-Path $baseDir)) {
+                    New-Item -ItemType Directory -Force -Path $baseDir | Out-Null
+                }
+                [System.IO.File]::WriteAllText($cachePath, $json, [System.Text.UTF8Encoding]::new($false))
+            }
+        } catch {
+            if (Test-Path $cachePath) {
+                try {
+                    $cacheContent = Get-Content -Path $cachePath -Raw -Encoding UTF8
+                    $cached = $cacheContent | ConvertFrom-Json
+                    if ($cached -and $cached.models) {
+                        $modelsData = @($cached.models)
+                        Write-Warning "Could not fetch fresh models from OpenRouter API ($($_.Exception.Message)). Using cached models."
+                    }
+                } catch {}
+            }
+            if (-not $modelsData) {
+                Write-Error "Failed to fetch models from OpenRouter: $($_.Exception.Message)"
+                return @()
+            }
+        }
+    }
+
+    $filtered = @($modelsData)
+    if ($FreeOnly) {
+        $filtered = @($filtered | Where-Object { Test-OpenRouterModelIsFree $_ })
+    }
+
+    if ($Search -and (-not [string]::IsNullOrWhiteSpace($Search))) {
+        $term = $Search.Trim()
+        $filtered = @($filtered | Where-Object {
+            ($_.id -and $_.id -like "*$term*") -or
+            ($_.name -and $_.name -like "*$term*") -or
+            ($_.description -and $_.description -like "*$term*")
+        })
+    }
+
+    return , $filtered
+}
+
+function Ensure-MultigravityApiPromptsDir {
+    $loc = (Get-Location).Path
+    $agentsDir = Join-Path $loc ".agents"
+    $promptsDir = $null
+    if (Test-Path $agentsDir) {
+        $tempDir = Join-Path $agentsDir "temp\prompts\api"
+        $tmpDir  = Join-Path $agentsDir "tmp\prompts\api"
+        New-Item -ItemType Directory -Force -Path $tempDir -ErrorAction SilentlyContinue | Out-Null
+        New-Item -ItemType Directory -Force -Path $tmpDir -ErrorAction SilentlyContinue | Out-Null
+        $promptsDir = $tempDir
+    } else {
+        $base = Get-BaseDir
+        $promptsDir = Join-Path $base ".agents\temp\prompts\api"
+        New-Item -ItemType Directory -Force -Path $promptsDir -ErrorAction SilentlyContinue | Out-Null
+    }
+    if (-not (Test-Path $promptsDir)) {
+        try {
+            New-Item -ItemType Directory -Force -Path $promptsDir -ErrorAction Stop | Out-Null
+        } catch {
+            $promptsDir = Join-Path ([System.IO.Path]::GetTempPath()) "multigravity\prompts\api"
+            New-Item -ItemType Directory -Force -Path $promptsDir -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+    return $promptsDir
+}
+
+function Get-OpenRouterModelPricingInfo {
+    param(
+        [string]$ModelId,
+        [int]$PromptCharLength = 0
+    )
+
+    $isFree = $false
+    if ($ModelId -and $ModelId -match ':free$') {
+        $isFree = $true
+    }
+
+    $models = Get-OpenRouterModels
+    $modelObj = $null
+    if ($models -and $models.Count -gt 0) {
+        foreach ($m in $models) {
+            if ($m.id -eq $ModelId) {
+                $modelObj = $m
+                break
+            }
+        }
+    }
+
+    if ($modelObj) {
+        if (Test-OpenRouterModelIsFree $modelObj) {
+            $isFree = $true
+        }
+    }
+
+    $promptPricePerToken = 0.0
+    $complPricePerToken  = 0.0
+    if ($modelObj -and $modelObj.pricing) {
+        try {
+            if ($null -ne $modelObj.pricing.prompt) {
+                $promptPricePerToken = [double]$modelObj.pricing.prompt
+            }
+            if ($null -ne $modelObj.pricing.completion) {
+                $complPricePerToken = [double]$modelObj.pricing.completion
+            }
+        } catch {}
+    }
+
+    if ($isFree) {
+        $promptPricePerToken = 0.0
+        $complPricePerToken  = 0.0
+    }
+
+    $promptPricePer1M = $promptPricePerToken * 1000000.0
+    $complPricePer1M  = $complPricePerToken * 1000000.0
+    $estTokens = [Math]::Ceiling($PromptCharLength / 4.0)
+    $estPromptCost = $estTokens * $promptPricePerToken
+
+    return [PSCustomObject]@{
+        ModelId             = $ModelId
+        ModelObject         = $modelObj
+        IsFree              = $isFree
+        PromptPricePerToken = $promptPricePerToken
+        ComplPricePerToken  = $complPricePerToken
+        PromptPricePer1M    = $promptPricePer1M
+        ComplPricePer1M     = $complPricePer1M
+        EstimatedTokens     = $estTokens
+        EstimatedPromptCost = $estPromptCost
+    }
+}
+
+function Confirm-OpenRouterPaidModel {
+    param(
+        $PricingInfo,
+        [switch]$Yes
+    )
+    if (-not $PricingInfo) { return $true }
+    if ($PricingInfo.IsFree) { return $true }
+    if ($Yes) { return $true }
+
+    $p1m = [string]::Format("{0:N2}", $PricingInfo.PromptPricePer1M)
+    $c1m = [string]::Format("{0:N2}", $PricingInfo.ComplPricePer1M)
+    $estCost = [string]::Format("{0:N5}", $PricingInfo.EstimatedPromptCost)
+
+    Write-Host ""
+    Write-Host "========================================================================" -ForegroundColor Yellow
+    Write-Host "[!] PAID MODEL WARNING: $($PricingInfo.ModelId)" -ForegroundColor Yellow
+    Write-Host "------------------------------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "  Estimated Input Tokens:  ~$($PricingInfo.EstimatedTokens) tokens"
+    Write-Host "  Prompt Pricing:          `$$p1m / 1M tokens"
+    Write-Host "  Completion Pricing:      `$$c1m / 1M tokens"
+    Write-Host "  Estimated Prompt Cost:   ~`$$estCost"
+    Write-Host "========================================================================" -ForegroundColor Yellow
+    Write-Host ""
+
+    $canPrompt = $false
+    try {
+        $canPrompt = [Environment]::UserInteractive -and (-not [System.Console]::IsInputRedirected)
+    } catch {
+        $canPrompt = $false
+    }
+
+    if ($canPrompt) {
+        $confirm = Read-Host "Proceed with API call to paid model? [y/N]"
+        if ($confirm -match '^(y|yes)$') {
+            return $true
+        } else {
+            Write-Host "Aborted by user."
+            return $false
+        }
+    } else {
+        Write-Error "Execution with paid model '$($PricingInfo.ModelId)' requires -y or --yes flag in non-interactive / piped mode."
+        return $false
+    }
+}
+
+function Format-OpenRouterModelsTable {
+    param([array]$Models)
+    if (-not $Models -or $Models.Count -eq 0) {
+        Write-Host "No matching models found."
+        return
+    }
+
+    $rows = [System.Collections.Generic.List[psobject]]::new()
+    foreach ($m in $Models) {
+        $isFree = Test-OpenRouterModelIsFree $m
+        $freeTag = if ($isFree) { "YES (FREE)" } else { "NO (PAID)" }
+
+        $promptPrice = "-"
+        $complPrice = "-"
+        if ($isFree) {
+            $promptPrice = "`$0.00"
+            $complPrice = "`$0.00"
+        } elseif ($m.pricing) {
+            try {
+                if ($null -ne $m.pricing.prompt) {
+                    $pNum = [double]$m.pricing.prompt * 1000000.0
+                    $promptPrice = "`$" + ([string]::Format("{0:N2}", $pNum))
+                }
+                if ($null -ne $m.pricing.completion) {
+                    $cNum = [double]$m.pricing.completion * 1000000.0
+                    $complPrice = "`$" + ([string]::Format("{0:N2}", $cNum))
+                }
+            } catch {}
+        }
+
+        $ctxStr = "-"
+        if ($m.context_length) {
+            $ctx = [int]$m.context_length
+            if ($ctx -ge 1000000) {
+                $mTokens = [Math]::Round($ctx / 1000000.0, 1)
+                $ctxStr = "${mTokens}M"
+            } elseif ($ctx -ge 1000) {
+                $kTokens = [Math]::Round($ctx / 1000.0, 0)
+                $ctxStr = "${kTokens}K"
+            } else {
+                $ctxStr = [string]$ctx
+            }
+        }
+
+        $name = if ($m.name) {
+            if ($m.name.Length -gt 36) { $m.name.Substring(0, 33) + "..." } else { $m.name }
+        } else { "-" }
+
+        $rows.Add([PSCustomObject]@{
+            "MODEL ID"    = $m.id
+            "NAME"        = $name
+            "PROMPT $/1M" = $promptPrice
+            "COMPL $/1M"  = $complPrice
+            "CONTEXT"     = $ctxStr
+            "FREE?"       = $freeTag
+        })
+    }
+
+    $rows | Format-Table -AutoSize | Out-String | Write-Host
+}
+
+function Invoke-OpenRouterApiConversation {
+    param(
+        [string]$ApiKey,
+        [string]$Model,
+        [array]$Messages,
+        [bool]$Stream = $true
+    )
+
+    if (-not $ApiKey) {
+        $ApiKey = Get-OpenRouterApiKey
+    }
+    if (-not $ApiKey) {
+        Write-Error "Error: No OpenRouter API key configured. Run 'multigravity openrouter key set <api-key>'."
+        return $null
+    }
+
+    $payloadObj = [PSCustomObject]@{
+        model    = $Model
+        messages = @($Messages)
+        stream   = [bool]$Stream
+    }
+    $payloadJson = $payloadObj | ConvertTo-Json -Depth 10
+
+    try {
+        Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+    } catch {}
+
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $client  = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [System.TimeSpan]::FromMinutes(5)
+
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "https://openrouter.ai/api/v1/chat/completions")
+    $request.Headers.Add("Authorization", "Bearer $ApiKey")
+    $request.Headers.Add("HTTP-Referer", "https://github.com/lcizzle/multigravity-win-cli")
+    $request.Headers.Add("X-Title", "Multigravity CLI")
+    $request.Content = [System.Net.Http.StringContent]::new($payloadJson, [System.Text.Encoding]::UTF8, "application/json")
+
+    $fullCompletion = [System.Text.StringBuilder]::new()
+
+    try {
+        $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+
+        if (-not $response.IsSuccessStatusCode) {
+            $errBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            $statusCode = [int]$response.StatusCode
+            Write-Error "OpenRouter API Error (HTTP $statusCode): $errBody"
+            return $null
+        }
+
+        if ($Stream) {
+            $streamObj = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $reader = [System.IO.StreamReader]::new($streamObj, [System.Text.Encoding]::UTF8)
+            try {
+                while (-not $reader.EndOfStream) {
+                    $line = $reader.ReadLine()
+                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                    if ($line.StartsWith("data: ")) {
+                        $dataStr = $line.Substring(6).Trim()
+                        if ($dataStr -eq "[DONE]") { break }
+                        try {
+                            $chunkObj = $dataStr | ConvertFrom-Json -ErrorAction Stop
+                            if ($chunkObj.choices -and $chunkObj.choices.Count -gt 0) {
+                                $delta = $chunkObj.choices[0].delta
+                                if ($delta -and $delta.content) {
+                                    $chunkText = [string]$delta.content
+                                    [System.Console]::Out.Write($chunkText)
+                                    [System.Console]::Out.Flush()
+                                    [void]$fullCompletion.Append($chunkText)
+                                }
+                            }
+                        } catch {}
+                    }
+                }
+                [System.Console]::Out.WriteLine()
+            } finally {
+                $reader.Dispose()
+                $streamObj.Dispose()
+            }
+        } else {
+            $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            $parsed = $body | ConvertFrom-Json
+            if ($parsed.choices -and $parsed.choices.Count -gt 0) {
+                $content = $parsed.choices[0].message.content
+                Write-Host $content
+                [void]$fullCompletion.Append($content)
+            }
+        }
+
+        return $fullCompletion.ToString()
+    } catch {
+        Write-Error "OpenRouter Request Exception: $($_.Exception.Message)"
+        return $null
+    } finally {
+        $request.Dispose()
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Find-NodeExecutable {
+    $cmd = Get-Command node.exe, node -ErrorAction SilentlyContinue
+    if ($cmd) {
+        if ($cmd -is [array]) { return $cmd[0].Source }
+        return $cmd.Source
+    }
+    return $null
+}
+
+function Get-AntigravityDataDir {
+    if ($env:MULTIGRAVITY_TEST_ANTIGRAVITY_DIR) {
+        return $env:MULTIGRAVITY_TEST_ANTIGRAVITY_DIR
+    }
+    if ($env:MULTIGRAVITY_ACTIVE_PROFILE) {
+        $pDir = Join-Path (Get-BaseDir) $env:MULTIGRAVITY_ACTIVE_PROFILE
+        $customGemini = Join-Path $pDir ".gemini\antigravity-cli"
+        if (Test-Path $customGemini) { return $customGemini }
+    }
+    return "$ROOT_USERPROFILE\.gemini\antigravity-cli"
+}
+
+function Resolve-AntigravityWorkspaceInfo {
+    param(
+        [string]$WorkspacePath = $null,
+        [string]$Project = $null,
+        [string]$AntigravityDataDir = $null
+    )
+    if (-not $AntigravityDataDir) {
+        $AntigravityDataDir = Get-AntigravityDataDir
+    }
+
+    $configProjectsDir = Join-Path (Split-Path $AntigravityDataDir -Parent) "config\projects"
+    if (-not (Test-Path $configProjectsDir)) {
+        $configProjectsDir = Join-Path $env:USERPROFILE ".gemini\config\projects"
+    }
+
+    $resolvedProjectId = $null
+    $resolvedWorkspacePath = $WorkspacePath
+
+    # 1. If -Project was specified, search config/projects/*.json by Name or ID or filename
+    if ($Project -and -not [string]::IsNullOrWhiteSpace($Project)) {
+        if (Test-Path $configProjectsDir) {
+            $pFiles = Get-ChildItem -Path (Join-Path $configProjectsDir "*.json") -ErrorAction SilentlyContinue
+            foreach ($pf in $pFiles) {
+                try {
+                    $pJson = Get-Content -Path $pf.FullName -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    if ($pJson) {
+                        if ($pJson.name -eq $Project -or $pJson.id -eq $Project -or $pf.BaseName -eq $Project) {
+                            $resolvedProjectId = $pJson.id
+                            if (-not $resolvedWorkspacePath -and $pJson.projectResources -and $pJson.projectResources.resources -and $pJson.projectResources.resources.Count -gt 0) {
+                                $firstUri = $pJson.projectResources.resources[0].folderUri
+                                if ($firstUri -match '^file:///(.+)$' -or $firstUri -match '^file://(.+)$') {
+                                    $resolvedWorkspacePath = $Matches[1]
+                                }
+                            }
+                            break
+                        }
+                    }
+                } catch {}
+            }
+        }
+
+        # If not found in config/projects, check if Project is a raw GUID
+        if (-not $resolvedProjectId -and ($Project -match '^[0-9a-fA-F-]{36}$')) {
+            $resolvedProjectId = $Project
+        }
+    }
+
+    # 2. Determine target path from resolved workspace path or current working directory
+    $targetPath = if ($resolvedWorkspacePath) {
+        if (Test-Path $resolvedWorkspacePath) {
+            (Resolve-Path $resolvedWorkspacePath).Path
+        } else {
+            $resolvedWorkspacePath
+        }
+    } else {
+        (Get-Location).Path
+    }
+    $normalized = ($targetPath -replace '\\', '/').TrimEnd('/')
+    $workspaceUri = "file:///" + $normalized.TrimStart('/')
+    $workspaceUrisJson = "[$([char]34)$workspaceUri$([char]34)]"
+
+    # 3. If project ID not yet resolved, check config/projects/*.json matching current workspace path
+    if (-not $resolvedProjectId -and (Test-Path $configProjectsDir)) {
+        $pFiles = Get-ChildItem -Path (Join-Path $configProjectsDir "*.json") -ErrorAction SilentlyContinue
+        foreach ($pf in $pFiles) {
+            try {
+                $pJson = Get-Content -Path $pf.FullName -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($pJson -and $pJson.id -and $pJson.projectResources -and $pJson.projectResources.resources) {
+                    foreach ($res in $pJson.projectResources.resources) {
+                        $fUri = $res.folderUri
+                        if ($fUri) {
+                            $cleanUri = ($fUri -replace '^file:///?', '').Replace('\', '/').TrimEnd('/')
+                            if ($cleanUri.Equals($normalized, [System.StringComparison]::OrdinalIgnoreCase)) {
+                                $resolvedProjectId = $pJson.id
+                                break
+                            }
+                        }
+                    }
+                    if ($resolvedProjectId) { break }
+                }
+            } catch {}
+        }
+    }
+
+    # 4. If project ID still not resolved, query conversation_summaries.db
+    if (-not $resolvedProjectId) {
+        $summariesDb = Join-Path $AntigravityDataDir "conversation_summaries.db"
+        if (Test-Path $summariesDb) {
+            try {
+                $nodeExe = Find-NodeExecutable
+                if ($nodeExe) {
+                    $findJs = @'
+const { DatabaseSync } = require('node:sqlite');
+try {
+    const db = new DatabaseSync(process.argv[1]);
+    const row = db.prepare('SELECT project_id FROM conversation_summaries WHERE workspace_uris LIKE ? AND length(project_id) > 0 LIMIT 1').get('%' + process.argv[2] + '%');
+    db.close();
+    if (row && row.project_id) { process.stdout.write(row.project_id); }
+} catch {}
+'@
+                    $foundProj = (& $nodeExe -e $findJs $summariesDb $normalized) | Out-String
+                    if ($foundProj -and -not [string]::IsNullOrWhiteSpace($foundProj.Trim())) {
+                        $resolvedProjectId = $foundProj.Trim()
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    if (-not $resolvedProjectId) {
+        $resolvedProjectId = "default-cli-project"
+    }
+
+    return [PSCustomObject]@{
+        WorkspacePath     = $targetPath
+        WorkspaceUri      = $workspaceUri
+        WorkspaceUrisJson = $workspaceUrisJson
+        ProjectId         = $resolvedProjectId
+    }
+}
+
+function Export-OpenRouterChatToAntigravityConversation {
+    param(
+        [array]$Messages,
+        [string]$ModelId,
+        [string]$Title = $null,
+        [string]$WorkspacePath = $null,
+        [string]$Project = $null,
+        [string]$AntigravityDataDir = $null
+    )
+
+    if (-not $AntigravityDataDir) {
+        $AntigravityDataDir = Get-AntigravityDataDir
+    }
+
+    $wsInfo = Resolve-AntigravityWorkspaceInfo -WorkspacePath $WorkspacePath -Project $Project -AntigravityDataDir $AntigravityDataDir
+    $convId = [System.Guid]::NewGuid().ToString()
+    $trajId = [System.Guid]::NewGuid().ToString()
+
+    $firstUserMsg = @($Messages | Where-Object { $_.role -eq "user" })
+    $firstUserText = if ($firstUserMsg.Count -gt 0) { [string]$firstUserMsg[0].content } else { "OpenRouter Chat" }
+    $cleanPrompt = ($firstUserText -replace "[\r\n\t]+", " ").Trim()
+
+    if (-not $Title) {
+        $previewSlice = if ($cleanPrompt.Length -gt 40) { $cleanPrompt.Substring(0, 40) + "..." } else { $cleanPrompt }
+        $shortModel = if ($ModelId) { $ModelId.Split('/')[-1] } else { "openrouter" }
+        $Title = "[$shortModel] $previewSlice"
+    }
+    $preview = if ($cleanPrompt.Length -gt 80) { $cleanPrompt.Substring(0, 80) + "..." } else { $cleanPrompt }
+
+    $nodeExe = Find-NodeExecutable
+    if (-not $nodeExe) {
+        Write-Error "Error: Node.js (node.exe) is required for Antigravity SQLite export bridge."
+        return $null
+    }
+
+    $wsTarget = $wsInfo.WorkspacePath
+    $repoUrl = $null
+    $repoSlug = $null
+    $branch = "main"
+    if ($wsTarget -and (Test-Path -LiteralPath $wsTarget)) {
+        try {
+            $rawRemote = (git -C $wsTarget config --get remote.origin.url 2>$null)
+            if ($rawRemote) {
+                $repoUrl = $rawRemote.Trim()
+                if ($repoUrl -match 'github\.com[:/]([^/]+/[^/.]+)') {
+                    $repoSlug = $matches[1] -replace '\.git$', ''
+                }
+            }
+            $rawBranch = (git -C $wsTarget rev-parse --abbrev-ref HEAD 2>$null)
+            if ($rawBranch -and $rawBranch -ne "HEAD") {
+                $branch = $rawBranch.Trim()
+            }
+        } catch {}
+    }
+    if (-not $repoSlug) {
+        $folderName = if ($wsTarget) { Split-Path $wsTarget -Leaf } else { "multigravity-win-cli" }
+        $repoSlug = if ($folderName -eq "multigravity-win-cli") { "lcizzle/multigravity-win-cli" } else { "local/$folderName" }
+    }
+    if (-not $repoUrl) {
+        $repoUrl = "https://github.com/$repoSlug.git"
+    }
+
+    $payloadObj = @{
+        dataDir       = $AntigravityDataDir
+        convId        = $convId
+        trajId        = $trajId
+        title         = $Title
+        preview       = $preview
+        workspaceUri  = $wsInfo.WorkspaceUri
+        workspacePath = $wsInfo.WorkspacePath
+        projectId     = $wsInfo.ProjectId
+        repoSlug      = $repoSlug
+        repoUrl       = $repoUrl
+        branch        = $branch
+        modelId       = $ModelId
+        messages      = @($Messages)
+    }
+    $payloadJson = $payloadObj | ConvertTo-Json -Depth 10
+
+    $bridgeJs = @'
+const { DatabaseSync } = require('node:sqlite');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+
+function varint(fieldNum, value) {
+    const header = (fieldNum << 3) | 0;
+    const bytes = [];
+    let h = header;
+    while (h >= 0x80) { bytes.push((h & 0x7F) | 0x80); h >>= 7; }
+    bytes.push(h);
+
+    let v = value;
+    while (v >= 0x80) { bytes.push((v & 0x7F) | 0x80); v >>= 7; }
+    bytes.push(v);
+    return Buffer.from(bytes);
+}
+
+function lengthDelimited(fieldNum, bufferOrString) {
+    const payload = Buffer.isBuffer(bufferOrString) ? bufferOrString : Buffer.from(bufferOrString, 'utf-8');
+    const header = (fieldNum << 3) | 2;
+    const bytes = [];
+    let h = header;
+    while (h >= 0x80) { bytes.push((h & 0x7F) | 0x80); h >>= 7; }
+    bytes.push(h);
+
+    let len = payload.length;
+    while (len >= 0x80) { bytes.push((len & 0x7F) | 0x80); len >>= 7; }
+    bytes.push(len);
+
+    return Buffer.concat([Buffer.from(bytes), payload]);
+}
+
+function buildTimestampProto(epochSec = Math.floor(Date.now() / 1000), nanos = 0) {
+    return Buffer.concat([
+        varint(1, epochSec),
+        varint(2, nanos)
+    ]);
+}
+
+function buildUserInputStepPayload(convId, trajId, workspaceUri, promptText, stepIdx = 0) {
+    const tsProto = buildTimestampProto(nowSec);
+
+    const trajConvMeta = Buffer.concat([
+        lengthDelimited(1, trajId),
+        varint(2, stepIdx),
+        lengthDelimited(4, convId)
+    ]);
+
+    const stepStatusMeta = Buffer.concat([
+        varint(1, 3),
+        lengthDelimited(2, tsProto)
+    ]);
+
+    const stepMeta = Buffer.concat([
+        lengthDelimited(1, tsProto),
+        varint(3, 4),
+        lengthDelimited(12, convId),
+        lengthDelimited(20, trajConvMeta),
+        lengthDelimited(26, lengthDelimited(1, stepStatusMeta))
+    ]);
+
+    const sub3 = Buffer.concat([
+        lengthDelimited(1, promptText)
+    ]);
+
+    const wsSub = Buffer.concat([
+        lengthDelimited(12, workspaceUri)
+    ]);
+
+    const promptPayload = Buffer.concat([
+        lengthDelimited(2, promptText),
+        lengthDelimited(3, sub3),
+        lengthDelimited(12, wsSub)
+    ]);
+
+    const payloadBuf = Buffer.concat([
+        varint(1, 14), // StepType = 14 (USER_INPUT)
+        varint(4, 3),  // Status = 3 (DONE)
+        lengthDelimited(5, stepMeta),
+        lengthDelimited(19, promptPayload)
+    ]);
+    return { stepMeta, payloadBuf };
+}
+
+function buildPlannerResponseStepPayload(convId, trajId, responseText, modelId = 'openrouter', thinking = '', stepIdx = 1) {
+    const tsProto = buildTimestampProto(nowSec);
+
+    const trajConvMeta = Buffer.concat([
+        lengthDelimited(1, trajId),
+        varint(2, stepIdx),
+        lengthDelimited(4, convId)
+    ]);
+
+    const stepStatusMeta = Buffer.concat([
+        varint(1, 3),
+        lengthDelimited(2, tsProto)
+    ]);
+
+    const stepMeta = Buffer.concat([
+        lengthDelimited(1, tsProto),
+        varint(3, 2),
+        lengthDelimited(7, tsProto),
+        lengthDelimited(8, tsProto),
+        lengthDelimited(12, convId),
+        lengthDelimited(20, trajConvMeta),
+        lengthDelimited(26, lengthDelimited(1, stepStatusMeta))
+    ]);
+
+    const respParts = [
+        lengthDelimited(1, responseText),
+        lengthDelimited(6, modelId),
+        lengthDelimited(8, responseText),
+        varint(12, 2)
+    ];
+    if (thinking) {
+        respParts.push(lengthDelimited(3, thinking));
+    }
+    const responseSub = Buffer.concat(respParts);
+
+    const payloadBuf = Buffer.concat([
+        varint(1, 15), // StepType = 15 (PLANNER_RESPONSE)
+        varint(4, 3),  // Status = 3 (DONE)
+        lengthDelimited(5, stepMeta),
+        lengthDelimited(20, responseSub)
+    ]);
+    return { stepMeta, payloadBuf };
+}
+
+const DEFAULT_FIELD15_BASE64 = "iJy2MKXFyTDwsY8x9rGPMfXplTH46ZUx+8/yMYLQ8jGT4/Qxwcj9MbqygzK/soMy4veDMu33gzKytIkyrMSuMrPErjLQ7bAy0+2wMvCQszLykLMy8u60MtPSuDLo7boy6u26MqH1ujKk9boyg/+8Ms3RvTLP0b0yj7C+MsPsvjLP7L4y0ey+Mr+CwDKOpcIylqXCMv28xDKKvcQyi73EMqC9xDKhvcQytr3EMuDUxjLl1MYy99TGMriGxzKt2ccyr9nHMpSHyDKTvMgynNHJMp7RyTKR78syru/LMoifzDLV1swy7NbMMreRzTK5kc0yhJPNMoeTzTLNos0yz6LNMvKlzjLUwc4y5NXTMtTv1TLP3dYy3/fWMt6E1zLihNcy/vzcMqrU3TKs1N0ysdTdMrPU3TLp+t4y6/reMtLv3zLX3uEy2d7hMoHZ4jKD2eIytfbkMtL95DL2necyja3oMpGt6DLGtegyxLjoMp+C6jKmguoyt4fqMr+H6jL85ewy/uXsMof87TKJ/O0ykPztMpL87TI=";
+
+function extractField15(dataDir, projectId) {
+    const convDir = path.join(dataDir, 'conversations');
+    if (!fs.existsSync(convDir)) return null;
+    let candidateFiles = [];
+    if (projectId) {
+        try {
+            const sumDbPath = path.join(dataDir, 'conversation_summaries.db');
+            if (fs.existsSync(sumDbPath)) {
+                const sumDb = new DatabaseSync(sumDbPath);
+                const rows = sumDb.prepare("SELECT conversation_id FROM conversation_summaries WHERE project_id = ? ORDER BY last_modified_time DESC").all(projectId);
+                sumDb.close();
+                candidateFiles = rows.map(r => r.conversation_id + '.db').filter(f => fs.existsSync(path.join(convDir, f)));
+            }
+        } catch {}
+    }
+    for (const file of candidateFiles) {
+        try {
+            const db = new DatabaseSync(path.join(convDir, file));
+            const row = db.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'").get();
+            db.close();
+            if (row && row.data && row.data.length > 500) {
+                const blob = Buffer.from(row.data);
+                const f15idx = blob.indexOf(Buffer.from([0x7a, 0x94, 0x03]));
+                if (f15idx !== -1 && f15idx + 3 + 404 <= blob.length) {
+                    return blob.subarray(f15idx + 3, f15idx + 3 + 404);
+                }
+            }
+        } catch {}
+    }
+    return null;
+}
+
+function buildTrajectoryMetadataBlob(convId, trajId, workspaceUri, projectId, repoSlug, repoUrl, branch, dataDir) {
+    const tsProto = buildTimestampProto(nowSec, 123456789);
+
+    const slug = repoSlug || 'lcizzle/multigravity-win-cli';
+    const url = repoUrl || `https://github.com/${slug}.git`;
+    const br = branch || 'main';
+
+    const wsInner = Buffer.concat([
+        lengthDelimited(1, slug),
+        lengthDelimited(2, url)
+    ]);
+
+    const wsBlock = Buffer.concat([
+        lengthDelimited(1, workspaceUri),
+        lengthDelimited(2, workspaceUri),
+        lengthDelimited(3, wsInner),
+        lengthDelimited(4, br)
+    ]);
+
+    let f15Buf = extractField15(dataDir, projectId);
+    if (!f15Buf) {
+        f15Buf = Buffer.from(DEFAULT_FIELD15_BASE64, 'base64');
+    }
+
+    return Buffer.concat([
+        lengthDelimited(1, wsBlock),
+        lengthDelimited(2, tsProto),
+        lengthDelimited(3, crypto.randomUUID()),
+        lengthDelimited(6, convId),
+        lengthDelimited(7, workspaceUri),
+        lengthDelimited(15, f15Buf),
+        lengthDelimited(18, projectId || 'default-cli-project')
+    ]);
+}
+
+const data = JSON.parse(fs.readFileSync(process.argv[2], 'utf-8'));
+const { dataDir, convId, trajId, title, preview, workspaceUri, workspacePath, projectId, repoSlug, repoUrl, branch, messages, modelId } = data;
+
+const nowIso = new Date().toISOString().replace('T', ' ').replace('Z', '+00:00');
+const nowIsoZ = new Date().toISOString();
+const nowSec = Math.floor(Date.now() / 1000);
+
+const convDir = path.join(dataDir, 'conversations');
+const brainDir = path.join(dataDir, 'brain', convId, '.system_generated', 'logs');
+const chunksTDir = path.join(brainDir, 'chunks', 'transcript');
+const chunksTFDir = path.join(brainDir, 'chunks', 'transcript_full');
+const annoDir = path.join(dataDir, 'annotations');
+fs.mkdirSync(convDir, { recursive: true });
+fs.mkdirSync(brainDir, { recursive: true });
+fs.mkdirSync(chunksTDir, { recursive: true });
+fs.mkdirSync(chunksTFDir, { recursive: true });
+fs.mkdirSync(annoDir, { recursive: true });
+
+// 1. conversation_summaries.db
+const summariesDbPath = path.join(dataDir, 'conversation_summaries.db');
+const summariesDb = new DatabaseSync(summariesDbPath);
+try {
+    summariesDb.exec(`
+        CREATE TABLE IF NOT EXISTS \`conversation_summaries\` (
+            \`conversation_id\` text,
+            \`title\` text NOT NULL DEFAULT "",
+            \`preview\` text NOT NULL DEFAULT "",
+            \`step_count\` integer NOT NULL DEFAULT 0,
+            \`last_modified_time\` datetime NOT NULL,
+            \`workspace_uris\` text NOT NULL,
+            \`status\` text NOT NULL DEFAULT "",
+            \`source\` text NOT NULL DEFAULT "",
+            \`project_id\` text NOT NULL DEFAULT "",
+            \`agent_name\` text NOT NULL DEFAULT "",
+            \`parent_conversation_id\` text NOT NULL DEFAULT "",
+            \`nesting_depth\` integer NOT NULL DEFAULT 0,
+            \`battle_id\` text NOT NULL DEFAULT "",
+            \`winning_conversation_id\` text NOT NULL DEFAULT "",
+            \`not_fully_idle\` numeric NOT NULL DEFAULT false,
+            \`killed\` numeric NOT NULL DEFAULT false,
+            \`last_user_input_time\` datetime NOT NULL,
+            \`last_user_input_step_index\` integer NOT NULL DEFAULT -1,
+            \`app_data_dir\` text NOT NULL DEFAULT "",
+            \`raw_summary\` blob,
+            group_id TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (\`conversation_id\`)
+        )
+    `);
+
+    const dialogTurns = messages.filter(m => m.role === 'user' || m.role === 'assistant');
+    const stepCount = dialogTurns.length;
+    const lastUserIdx = dialogTurns.map((m, i) => m.role === 'user' ? i : -1).filter(i => i >= 0).pop() ?? 0;
+
+    const insertSummary = summariesDb.prepare(`
+        INSERT OR REPLACE INTO conversation_summaries (
+            conversation_id, title, preview, step_count, last_modified_time,
+            workspace_uris, status, source, project_id, agent_name,
+            parent_conversation_id, nesting_depth, battle_id, winning_conversation_id,
+            not_fully_idle, killed, last_user_input_time, last_user_input_step_index,
+            app_data_dir, group_id
+        ) VALUES (
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?
+        )
+    `);
+
+    insertSummary.run(
+        convId,
+        title,
+        preview,
+        stepCount,
+        nowIso,
+        JSON.stringify([workspaceUri]),
+        "",
+        "",
+        projectId,
+        "",
+        "",
+        0,
+        "",
+        "",
+        0,
+        0,
+        nowIso,
+        lastUserIdx,
+        "antigravity-cli",
+        ""
+    );
+} finally {
+    summariesDb.close();
+}
+
+// 2. conversations/<convId>.db
+const convDbPath = path.join(convDir, `${convId}.db`);
+const convDb = new DatabaseSync(convDbPath);
+try {
+    convDb.exec(`
+        PRAGMA user_version = 1;
+        CREATE TABLE IF NOT EXISTS \`trajectory_meta\` (
+            \`trajectory_id\` text,
+            \`cascade_id\` text,
+            \`trajectory_type\` integer,
+            \`source\` integer,
+            PRIMARY KEY (\`trajectory_id\`)
+        );
+        CREATE TABLE IF NOT EXISTS \`steps\` (
+            \`idx\` integer,
+            \`step_type\` integer NOT NULL DEFAULT 0,
+            \`status\` integer NOT NULL DEFAULT 0,
+            \`has_subtrajectory\` numeric NOT NULL DEFAULT false,
+            \`metadata\` blob,
+            \`error_details\` blob,
+            \`permissions\` blob,
+            \`task_details\` blob,
+            \`render_info\` blob,
+            \`step_payload\` blob,
+            \`step_format\` integer NOT NULL DEFAULT 0,
+            PRIMARY KEY (\`idx\`)
+        );
+        CREATE TABLE IF NOT EXISTS \`gen_metadata\` (
+            \`idx\` integer,
+            \`data\` blob,
+            \`size\` integer NOT NULL DEFAULT 0,
+            PRIMARY KEY (\`idx\`)
+        );
+        CREATE TABLE IF NOT EXISTS \`executor_metadata\` (
+            \`idx\` integer,
+            \`data\` blob,
+            PRIMARY KEY (\`idx\`)
+        );
+        CREATE TABLE IF NOT EXISTS \`parent_references\` (
+            \`idx\` integer,
+            \`data\` blob,
+            PRIMARY KEY (\`idx\`)
+        );
+        CREATE TABLE IF NOT EXISTS \`trajectory_metadata_blob\` (
+            \`id\` text DEFAULT "main",
+            \`data\` blob,
+            PRIMARY KEY (\`id\`)
+        );
+        CREATE TABLE IF NOT EXISTS \`battle_mode_infos\` (
+            \`idx\` integer,
+            \`data\` blob,
+            PRIMARY KEY (\`idx\`)
+        );
+    `);
+
+    convDb.prepare(`
+        INSERT OR REPLACE INTO trajectory_meta (trajectory_id, cascade_id, trajectory_type, source)
+        VALUES (?, ?, 4, 17)
+    `).run(trajId, convId);
+
+    const trajMetaBlob = buildTrajectoryMetadataBlob(convId, trajId, workspaceUri, projectId, repoSlug, repoUrl, branch, dataDir);
+    convDb.prepare(`
+        INSERT OR REPLACE INTO trajectory_metadata_blob (id, data)
+        VALUES (?, ?)
+    `).run('main', trajMetaBlob);
+
+    const insertStep = convDb.prepare(`
+        INSERT OR REPLACE INTO steps (idx, step_type, status, has_subtrajectory, metadata, step_payload, step_format)
+        VALUES (?, ?, 3, 0, ?, ?, 0)
+    `);
+
+    const transcriptEntries = [];
+    let stepIdx = 0;
+    for (const msg of messages) {
+        if (msg.role === 'system') continue;
+        if (msg.role === 'user') {
+            const { stepMeta, payloadBuf } = buildUserInputStepPayload(convId, trajId, workspaceUri, msg.content, stepIdx);
+            insertStep.run(stepIdx, 14, stepMeta, payloadBuf);
+
+            transcriptEntries.push({
+                step_index: stepIdx,
+                source: "USER_EXPLICIT",
+                type: "USER_INPUT",
+                status: "DONE",
+                created_at: nowIsoZ,
+                content: `<USER_REQUEST>\n${msg.content}\n</USER_REQUEST>`
+            });
+        } else if (msg.role === 'assistant') {
+            const { stepMeta, payloadBuf } = buildPlannerResponseStepPayload(convId, trajId, msg.content, msg.model || modelId, msg.thinking || '', stepIdx);
+            insertStep.run(stepIdx, 15, stepMeta, payloadBuf);
+
+            transcriptEntries.push({
+                step_index: stepIdx,
+                source: "MODEL",
+                type: "PLANNER_RESPONSE",
+                status: "DONE",
+                created_at: nowIsoZ,
+                content: msg.content,
+                thinking: msg.thinking || undefined
+            });
+        }
+        stepIdx++;
+    }
+
+    const jsonlContent = transcriptEntries.map(e => JSON.stringify(e)).join('\n') + '\n';
+    fs.writeFileSync(path.join(brainDir, 'transcript.jsonl'), jsonlContent, 'utf-8');
+    fs.writeFileSync(path.join(brainDir, 'transcript_full.jsonl'), jsonlContent, 'utf-8');
+    fs.writeFileSync(path.join(chunksTDir, '00000000.jsonl'), jsonlContent, 'utf-8');
+    fs.writeFileSync(path.join(chunksTFDir, '00000000.jsonl'), jsonlContent, 'utf-8');
+    fs.writeFileSync(path.join(annoDir, `${convId}.pbtxt`), `title:"${title.replace(/"/g, '\\"')}"\n`, 'utf-8');
+
+    // 3. Append to history.jsonl
+    try {
+        const histPath = path.join(dataDir, 'history.jsonl');
+        const wsTarget = workspacePath || (workspaceUri ? workspaceUri.replace('file:///', '').replace(/\//g, '\\') : '');
+        const histEntry = JSON.stringify({
+            display: title,
+            timestamp: Date.now(),
+            workspace: wsTarget,
+            conversationId: convId
+        });
+        fs.appendFileSync(histPath, (fs.existsSync(histPath) ? '\n' : '') + histEntry + '\n', 'utf-8');
+    } catch {}
+} finally {
+    convDb.close();
+}
+
+process.stdout.write(JSON.stringify({
+    success: true,
+    convId: convId,
+    title: title,
+    resumeCmd: `agy resume ${convId}`
+}));
+'@
+
+    $tempJsFile = [System.IO.Path]::GetTempFileName() + ".js"
+    $tempPayloadFile = [System.IO.Path]::GetTempFileName() + ".json"
+    try {
+        [System.IO.File]::WriteAllText($tempJsFile, $bridgeJs, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText($tempPayloadFile, $payloadJson, [System.Text.UTF8Encoding]::new($false))
+        $rawJsonOut = (& $nodeExe $tempJsFile $tempPayloadFile) | Out-String
+        $resObj = $rawJsonOut | ConvertFrom-Json -ErrorAction SilentlyContinue
+
+        if ($resObj -and $resObj.success) {
+            Write-Host ""
+            Write-Host "========================================================================" -ForegroundColor Green
+            Write-Host " [OK] Conversation Saved to Antigravity!" -ForegroundColor Green
+            Write-Host "      Conversation ID : $convId" -ForegroundColor Cyan
+            Write-Host "      Project / Scope : $($wsInfo.ProjectId)" -ForegroundColor DarkGray
+            Write-Host "      Workspace URI   : $($wsInfo.WorkspaceUri)" -ForegroundColor DarkGray
+            Write-Host "      Title           : $Title" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host " [INFO] Resume pairing with Gemini at any time:" -ForegroundColor Yellow
+            Write-Host "        agy resume $convId" -ForegroundColor White
+            Write-Host "========================================================================" -ForegroundColor Green
+            Write-Host ""
+
+            return [PSCustomObject]@{
+                ConversationId = $convId
+                TrajectoryId   = $trajId
+                Title          = $Title
+                WorkspaceUri   = $wsInfo.WorkspaceUri
+                ProjectId      = $wsInfo.ProjectId
+                ResumeCommand  = "agy resume $convId"
+            }
+        } else {
+            Write-Error "Failed to export conversation to Antigravity: $rawJsonOut"
+            return $null
+        }
+    } finally {
+        if (Test-Path $tempJsFile) {
+            Remove-Item -Force $tempJsFile -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $tempPayloadFile) {
+            Remove-Item -Force $tempPayloadFile -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Remove-AntigravityConversation {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ConversationId,
+        [string]$AntigravityDataDir = $null
+    )
+
+    if (-not $AntigravityDataDir) {
+        $AntigravityDataDir = Get-AntigravityDataDir
+    }
+
+    $convId = $ConversationId.Trim()
+    $purged = [System.Collections.Generic.List[string]]::new()
+
+    # 1. Delete conversations/<convId>.db (and WAL/SHM)
+    $convDir = Join-Path $AntigravityDataDir "conversations"
+    foreach ($suffix in @("", "-wal", "-shm")) {
+        $dbFile = Join-Path $convDir "$convId.db$suffix"
+        if (Test-Path $dbFile) {
+            Remove-Item -Force $dbFile -ErrorAction SilentlyContinue
+            $purged.Add("conversations/$convId.db$suffix")
+        }
+    }
+
+    # 2. Delete brain/<convId> directory
+    $brainDir = Join-Path $AntigravityDataDir "brain\$convId"
+    if (Test-Path $brainDir) {
+        Remove-Item -Recurse -Force $brainDir -ErrorAction SilentlyContinue
+        $purged.Add("brain/$convId")
+    }
+
+    # 3. Delete annotations/<convId>.pbtxt
+    $annoFile = Join-Path $AntigravityDataDir "annotations\$convId.pbtxt"
+    if (Test-Path $annoFile) {
+        Remove-Item -Force $annoFile -ErrorAction SilentlyContinue
+        $purged.Add("annotations/$convId.pbtxt")
+    }
+
+    # 4. Delete row from conversation_summaries.db
+    $summariesDbPath = Join-Path $AntigravityDataDir "conversation_summaries.db"
+    if (Test-Path $summariesDbPath) {
+        $nodeExe = Find-NodeExecutable
+        if ($nodeExe) {
+            $delJs = @'
+const { DatabaseSync } = require('node:sqlite');
+try {
+    const db = new DatabaseSync(process.argv[1]);
+    const res = db.prepare('DELETE FROM conversation_summaries WHERE conversation_id = ?').run(process.argv[2]);
+    db.close();
+    if (res.changes > 0) { process.stdout.write('1'); }
+} catch {}
+'@
+            $delRes = (& $nodeExe -e $delJs $summariesDbPath $convId) | Out-String
+            if ($delRes -and $delRes.Trim() -eq "1") {
+                $purged.Add("conversation_summaries.db row")
+            }
+        }
+    }
+
+    # 5. Remove from history.jsonl
+    $histPath = Join-Path $AntigravityDataDir "history.jsonl"
+    if (Test-Path $histPath) {
+        try {
+            $lines = [System.IO.File]::ReadAllLines($histPath, [System.Text.Encoding]::UTF8)
+            $filtered = [System.Collections.Generic.List[string]]::new()
+            $foundHist = $false
+            foreach ($line in $lines) {
+                if (-not [string]::IsNullOrWhiteSpace($line) -and $line.Contains($convId)) {
+                    $foundHist = $true
+                } else {
+                    $filtered.Add($line)
+                }
+            }
+            if ($foundHist) {
+                [System.IO.File]::WriteAllLines($histPath, $filtered, [System.Text.UTF8Encoding]::new($false))
+                $purged.Add("history.jsonl entry")
+            }
+        } catch {}
+    }
+
+    return @($purged)
+}
+
+function Invoke-ConversationCommand {
+    param(
+        [string]$SubCommand,
+        [string[]]$SubArgs
+    )
+
+    $action = if ($SubCommand) { $SubCommand.ToLowerInvariant() } else { "list" }
+    $dataDir = Get-AntigravityDataDir
+
+    switch ($action) {
+        { $_ -in @("purge", "delete", "remove", "rm") } {
+            $targetId = if ($SubArgs -and $SubArgs.Count -gt 0) { $SubArgs[0] } else { $null }
+            if (-not $targetId) {
+                Write-Error "Error: Specify a conversation ID to purge. Usage: multigravity conv purge <conv-id>"
+                Exit-Multigravity 1
+            }
+            $purged = Remove-AntigravityConversation -ConversationId $targetId -AntigravityDataDir $dataDir
+            if ($purged.Count -gt 0) {
+                Write-Host "[OK] Conversation $targetId permanently purged:" -ForegroundColor Green
+                foreach ($p in $purged) {
+                    Write-Host "  - Removed: $p" -ForegroundColor DarkGray
+                }
+            } else {
+                Write-Host "[INFO] No on-disk artifacts found for conversation $targetId." -ForegroundColor Yellow
+            }
+        }
+        "prune" {
+            $nodeExe = Find-NodeExecutable
+            if (-not $nodeExe) {
+                Write-Error "Error: Node.js required to prune conversations."
+                Exit-Multigravity 1
+            }
+            $pruneJs = @'
+const fs = require('node:fs');
+const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
+const dataDir = process.argv[1];
+
+const sumDbPath = path.join(dataDir, 'conversation_summaries.db');
+if (!fs.existsSync(sumDbPath)) { process.exit(0); }
+const sumDb = new DatabaseSync(sumDbPath);
+
+const ghostRows = sumDb.prepare('SELECT conversation_id FROM conversation_summaries WHERE last_modified_time LIKE ? AND (length(title) = 0 OR step_count <= 2)').all('0001%');
+sumDb.close();
+
+const ghostIds = ghostRows.map(r => r.conversation_id);
+process.stdout.write(JSON.stringify(ghostIds));
+'@
+            $ghostsJson = (& $nodeExe -e $pruneJs $dataDir) | Out-String
+            $ghostIds = $ghostsJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($ghostIds -and $ghostIds.Count -gt 0) {
+                Write-Host "Found $($ghostIds.Count) orphaned ghost conversation(s). Pruning..." -ForegroundColor Yellow
+                foreach ($gid in $ghostIds) {
+                    $purged = Remove-AntigravityConversation -ConversationId $gid -AntigravityDataDir $dataDir
+                    Write-Host "  [OK] Pruned $gid ($($purged.Count) artifacts removed)" -ForegroundColor DarkGray
+                }
+                Write-Host "[OK] Ghost conversations pruned successfully." -ForegroundColor Green
+            } else {
+                Write-Host "[OK] No orphaned ghost conversations found to prune." -ForegroundColor Green
+            }
+        }
+        "list" {
+            $nodeExe = Find-NodeExecutable
+            if (-not $nodeExe) {
+                Write-Error "Error: Node.js required to list conversations."
+                Exit-Multigravity 1
+            }
+            $listJs = @'
+const fs = require('node:fs');
+const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
+const dataDir = process.argv[1];
+const sumDbPath = path.join(dataDir, 'conversation_summaries.db');
+if (!fs.existsSync(sumDbPath)) { process.exit(0); }
+const sumDb = new DatabaseSync(sumDbPath);
+const rows = sumDb.prepare('SELECT conversation_id, title, project_id, last_modified_time, step_count FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 20').all();
+sumDb.close();
+process.stdout.write(JSON.stringify(rows));
+'@
+            $rowsJson = (& $nodeExe -e $listJs $dataDir) | Out-String
+            $rows = $rowsJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($rows -and $rows.Count -gt 0) {
+                Write-Host "Recent Antigravity Conversations (Count: $($rows.Count)):" -ForegroundColor Cyan
+                Write-Host ("  {0,-38} {1,-35} {2,-12} {3}" -f "CONVERSATION ID", "TITLE", "STEPS", "LAST MODIFIED") -ForegroundColor White
+                Write-Host ("  {0,-38} {1,-35} {2,-12} {3}" -f ("-" * 36), ("-" * 33), ("-" * 10), ("-" * 15)) -ForegroundColor DarkGray
+                foreach ($r in $rows) {
+                    $t = if ($r.title) { if ($r.title.Length -gt 33) { $r.title.Substring(0, 30) + "..." } else { $r.title } } else { "[Untitled]" }
+                    $mod = if ($r.last_modified_time) { $r.last_modified_time.Substring(0, [Math]::Min(19, $r.last_modified_time.Length)) } else { "-" }
+                    Write-Host ("  {0,-38} {1,-35} {2,-12} {3}" -f $r.conversation_id, $t, $r.step_count, $mod)
+                }
+            } else {
+                Write-Host "No conversations found."
+            }
+        }
+        default {
+            Write-Host "Antigravity Conversation Management (multigravity conv)"
+            Write-Host ""
+            Write-Host "Commands:"
+            Write-Host "  multigravity conv list                List recent conversations"
+            Write-Host "  multigravity conv purge <conv-id>     Permanently purge conversation and all on-disk artifacts"
+            Write-Host "  multigravity conv delete <conv-id>    Alias for purge"
+            Write-Host "  multigravity conv prune               Scan and purge orphaned/ghost conversations"
+        }
+    }
+}
+
+function Invoke-OpenRouterPromptCommand {
+    param(
+        [string[]]$SubArgs,
+        $PipelineData = $null
+    )
+
+    $apiKey = Get-OpenRouterApiKey
+    if (-not $apiKey) {
+        Write-Error "Error: No OpenRouter API key configured. Set one with 'multigravity openrouter key set <api-key>'."
+        Exit-Multigravity 1
+    }
+
+    $model = $null
+    $promptText = $null
+    $promptFile = $null
+    $systemPrompt = $null
+    $freeOnly = $false
+    $autoConfirm = $false
+    $stream = $true
+    $forceSave = $false
+    $saveConv = $false
+    $customTitle = $null
+    $customWorkspace = $null
+    $customProject = $null
+
+    if ($SubArgs) {
+        for ($i = 0; $i -lt $SubArgs.Count; $i++) {
+            $arg = $SubArgs[$i]
+            if (($arg -in @("-m", "--model")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $model = $SubArgs[$i + 1]
+                $i++
+            } elseif ($arg -match '^--model=(.+)$') {
+                $model = $Matches[1]
+            } elseif (($arg -in @("-p", "--prompt", "--print")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $promptText = $SubArgs[$i + 1]
+                $i++
+            } elseif ($arg -match '^(-p|--prompt|--print)=(.+)$') {
+                $promptText = $Matches[2]
+            } elseif (($arg -in @("-f", "--prompt-file", "--file")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $promptFile = $SubArgs[$i + 1]
+                $i++
+            } elseif ($arg -match '^(-f|--prompt-file|--file)=(.+)$') {
+                $promptFile = $Matches[2]
+            } elseif (($arg -in @("-s", "--system", "--system-prompt")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $systemPrompt = $SubArgs[$i + 1]
+                $i++
+            } elseif ($arg -match '^(-s|--system|--system-prompt)=(.+)$') {
+                $systemPrompt = $Matches[2]
+            } elseif (($arg -in @("-t", "--title")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $customTitle = $SubArgs[$i + 1]
+                $i++
+            } elseif ($arg -match '^(-t|--title)=(.+)$') {
+                $customTitle = $Matches[2]
+            } elseif (($arg -in @("-w", "--workspace", "--dir")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $customWorkspace = $SubArgs[$i + 1]
+                $i++
+            } elseif ($arg -match '^(-w|--workspace|--dir)=(.+)$') {
+                $customWorkspace = $Matches[2]
+            } elseif (($arg -in @("--project", "-project")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $customProject = $SubArgs[$i + 1]
+                $i++
+            } elseif ($arg -match '^(--project|-project)=(.+)$') {
+                $customProject = $Matches[2]
+            } elseif ($arg -in @("-y", "--yes", "--no-confirm")) {
+                $autoConfirm = $true
+            } elseif ($arg -in @("--free", "-free")) {
+                $freeOnly = $true
+            } elseif ($arg -in @("--raw", "--no-stream")) {
+                $stream = $false
+            } elseif ($arg -in @("--save", "--save-prompt")) {
+                $forceSave = $true
+            } elseif ($arg -in @("--save-conv", "--save-conversation", "--export-agy", "--export-conversation")) {
+                $saveConv = $true
+            }
+        }
+    }
+
+    # Handle Piped Input ($PipelineData or -p -)
+    if (($promptText -eq "-") -or (-not $promptText -and -not $promptFile -and $PipelineData -and $PipelineData.Count -gt 0)) {
+        if ($PipelineData -and $PipelineData.Count -gt 0) {
+            $promptText = ($PipelineData -join "`n").Trim()
+            $promptsDir = Ensure-MultigravityApiPromptsDir
+            $timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+            $guid = [System.Guid]::NewGuid().ToString("N").Substring(0, 8)
+            $savedPromptPath = Join-Path $promptsDir "piped_prompt_${timestamp}_${guid}.md"
+            $mdHeader = "---`ncreated: $(Get-Date -Format 'o')`nsource: piped`n---`n`n"
+            [System.IO.File]::WriteAllText($savedPromptPath, $mdHeader + $promptText, [System.Text.UTF8Encoding]::new($false))
+        }
+    }
+
+    # Handle Prompt File (-f / --prompt-file)
+    if ($promptFile) {
+        if (-not (Test-Path $promptFile)) {
+            Write-Error "Error: Prompt file not found: '$promptFile'"
+            Exit-Multigravity 1
+        }
+        $promptText = [System.IO.File]::ReadAllText((Resolve-Path $promptFile).Path, [System.Text.Encoding]::UTF8)
+    }
+
+    # Fallback to positional prompt if not set
+    if (-not $promptText -and $SubArgs) {
+        $positional = @($SubArgs | Where-Object {
+            $_ -ne "prompt" -and -not $_.StartsWith("-")
+        })
+        if ($positional.Count -gt 0) {
+            $promptText = ($positional -join " ").Trim()
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($promptText)) {
+        Write-Error "Error: No prompt provided. Specify -p <prompt>, -f <file>, or pipe text to stdin."
+        Exit-Multigravity 1
+    }
+
+    # Auto-spillover for large inline prompt strings (>4000 chars)
+    if ($promptText.Length -gt 4000 -or $forceSave) {
+        $promptsDir = Ensure-MultigravityApiPromptsDir
+        $timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+        $guid = [System.Guid]::NewGuid().ToString("N").Substring(0, 8)
+        $spillFile = Join-Path $promptsDir "large_prompt_${timestamp}_${guid}.md"
+        $mdHeader = "---`ncreated: $(Get-Date -Format 'o')`nchars: $($promptText.Length)`n---`n`n"
+        [System.IO.File]::WriteAllText($spillFile, $mdHeader + $promptText, [System.Text.UTF8Encoding]::new($false))
+    }
+
+    # Resolve Model
+    if (-not $model) {
+        $freeModels = Get-OpenRouterModels -FreeOnly
+        if ($freeModels -and $freeModels.Count -gt 0) {
+            $pref = @($freeModels | Where-Object { $_.id -eq "openrouter/free" })
+            if ($pref -and $pref.Count -gt 0) {
+                $model = "openrouter/free"
+            } else {
+                $model = $freeModels[0].id
+            }
+        } else {
+            $model = "openrouter/free"
+        }
+    }
+
+    # Pricing & Confirmation Guard
+    $pricing = Get-OpenRouterModelPricingInfo -ModelId $model -PromptCharLength $promptText.Length
+    $confirmed = Confirm-OpenRouterPaidModel -PricingInfo $pricing -Yes:$autoConfirm
+    if (-not $confirmed) {
+        Exit-Multigravity 0
+    }
+
+    # Prepare Messages
+    $messages = [System.Collections.Generic.List[psobject]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($systemPrompt)) {
+        $messages.Add([PSCustomObject]@{ role = "system"; content = $systemPrompt })
+    }
+    $messages.Add([PSCustomObject]@{ role = "user"; content = $promptText })
+
+    $completionText = Invoke-OpenRouterApiConversation -ApiKey $apiKey -Model $model -Messages @($messages) -Stream $stream
+
+    # If --save-conv was requested, export conversation to Antigravity
+    if ($saveConv -and $completionText) {
+        $exportMsgs = [System.Collections.Generic.List[psobject]]::new()
+        if (-not [string]::IsNullOrWhiteSpace($systemPrompt)) {
+            $exportMsgs.Add([PSCustomObject]@{ role = "system"; content = $systemPrompt })
+        }
+        $exportMsgs.Add([PSCustomObject]@{ role = "user"; content = $promptText })
+        $exportMsgs.Add([PSCustomObject]@{ role = "assistant"; content = $completionText; model = $model })
+
+        Export-OpenRouterChatToAntigravityConversation -Messages @($exportMsgs) -ModelId $model -Title $customTitle -WorkspacePath $customWorkspace -Project $customProject | Out-Null
+    }
+}
+
+function Invoke-OpenRouterChatCommand {
+    param(
+        [string[]]$SubArgs
+    )
+
+    $apiKey = Get-OpenRouterApiKey
+    if (-not $apiKey) {
+        Write-Error "Error: No OpenRouter API key configured. Set one with 'multigravity openrouter key set <api-key>'."
+        Exit-Multigravity 1
+    }
+
+    $model = $null
+    $systemPrompt = "You are an expert AI assistant."
+    $autoConfirm = $false
+    $customWorkspace = $null
+    $customProject = $null
+
+    if ($SubArgs) {
+        for ($i = 0; $i -lt $SubArgs.Count; $i++) {
+            $a = $SubArgs[$i]
+            if (($a -in @("-m", "--model")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $model = $SubArgs[$i + 1]
+                $i++
+            } elseif ($a -match '^--model=(.+)$') {
+                $model = $Matches[1]
+            } elseif (($a -in @("-s", "--system", "--system-prompt")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $systemPrompt = $SubArgs[$i + 1]
+                $i++
+            } elseif ($a -match '^(-s|--system|--system-prompt)=(.+)$') {
+                $systemPrompt = $Matches[2]
+            } elseif (($a -in @("-w", "--workspace", "--dir")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $customWorkspace = $SubArgs[$i + 1]
+                $i++
+            } elseif ($a -match '^(-w|--workspace|--dir)=(.+)$') {
+                $customWorkspace = $Matches[2]
+            } elseif (($a -in @("--project", "-project")) -and ($i + 1 -lt $SubArgs.Count)) {
+                $customProject = $SubArgs[$i + 1]
+                $i++
+            } elseif ($a -match '^(--project|-project)=(.+)$') {
+                $customProject = $Matches[2]
+            } elseif ($a -in @("-y", "--yes", "--no-confirm")) {
+                $autoConfirm = $true
+            }
+        }
+    }
+
+    if (-not $model) {
+        $freeModels = Get-OpenRouterModels -FreeOnly
+        if ($freeModels -and $freeModels.Count -gt 0) {
+            $pref = @($freeModels | Where-Object { $_.id -eq "openrouter/free" })
+            if ($pref -and $pref.Count -gt 0) {
+                $model = "openrouter/free"
+            } else {
+                $model = $freeModels[0].id
+            }
+        } else {
+            $model = "openrouter/free"
+        }
+    }
+
+    Write-Host "========================================================================" -ForegroundColor Cyan
+    Write-Host " Multigravity OpenRouter Chat REPL" -ForegroundColor Cyan
+    Write-Host " Active Model: $model" -ForegroundColor Cyan
+    Write-Host " Commands: /help, /models, /model <id>, /system <text>, /save [title], /clear, /exit" -ForegroundColor DarkGray
+    Write-Host "========================================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    $history = [System.Collections.Generic.List[psobject]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($systemPrompt)) {
+        $history.Add([PSCustomObject]@{ role = "system"; content = $systemPrompt })
+    }
+
+    while ($true) {
+        $inputPrompt = $null
+        try {
+            if ([Console]::IsInputRedirected) {
+                $inputPrompt = [Console]::In.ReadLine()
+            } else {
+                $inputPrompt = Read-Host "multigravity:openrouter [$model]"
+            }
+        } catch {
+            $inputPrompt = $null
+        }
+        if ($null -eq $inputPrompt) { break }
+        if ([string]::IsNullOrWhiteSpace($inputPrompt)) { continue }
+
+        $trimmed = $inputPrompt.Trim()
+        if ($trimmed -in @("/exit", "/quit", "exit", "quit")) {
+            Write-Host "Exiting chat session."
+            break
+        }
+        if ($trimmed -in @("/clear", "/reset")) {
+            $history.Clear()
+            if (-not [string]::IsNullOrWhiteSpace($systemPrompt)) {
+                $history.Add([PSCustomObject]@{ role = "system"; content = $systemPrompt })
+            }
+            Write-Host "Conversation history cleared." -ForegroundColor Green
+            continue
+        }
+        if ($trimmed -in @("/help", "/?")) {
+            Write-Host "REPL Commands:"
+            Write-Host "  /model <name>  - Switch active model"
+            Write-Host "  /models        - List available free & popular models"
+            Write-Host "  /save [title]  - Export chat history to Antigravity conversation DB"
+            Write-Host "  /clear         - Clear conversation history"
+            Write-Host "  /system <txt>  - Update system prompt"
+            Write-Host "  /exit          - Exit chat"
+            continue
+        }
+        if ($trimmed.StartsWith("/save") -or $trimmed.StartsWith("/export")) {
+            $saveTitle = $null
+            if ($trimmed -match '^/(save|export)\s+(.+)$') {
+                $saveTitle = $Matches[2].Trim()
+            }
+            $activeTurns = @($history | Where-Object { $_.role -in @("user", "assistant") })
+            if ($activeTurns.Count -eq 0) {
+                Write-Host "No chat history to save." -ForegroundColor Yellow
+                continue
+            }
+            Export-OpenRouterChatToAntigravityConversation -Messages @($history) -ModelId $model -Title $saveTitle -WorkspacePath $customWorkspace -Project $customProject | Out-Null
+            continue
+        }
+        if ($trimmed.StartsWith("/model ")) {
+            $newModel = $trimmed.Substring(7).Trim()
+            if ($newModel) {
+                $model = $newModel
+                Write-Host "Model switched to: $model" -ForegroundColor Green
+            }
+            continue
+        }
+        if ($trimmed -eq "/models") {
+            $mList = Get-OpenRouterModels -FreeOnly
+            Format-OpenRouterModelsTable -Models $mList
+            continue
+        }
+        if ($trimmed.StartsWith("/system ")) {
+            $systemPrompt = $trimmed.Substring(8).Trim()
+            Write-Host "System prompt updated." -ForegroundColor Green
+            continue
+        }
+
+        # Pricing check if paid
+        $pricing = Get-OpenRouterModelPricingInfo -ModelId $model -PromptCharLength $trimmed.Length
+        if ((-not $pricing.IsFree) -and (-not $autoConfirm)) {
+            $confirmed = Confirm-OpenRouterPaidModel -PricingInfo $pricing
+            if (-not $confirmed) { continue }
+        }
+
+        $history.Add([PSCustomObject]@{ role = "user"; content = $trimmed })
+
+        # Call streaming
+        Write-Host ""
+        $assistantText = Invoke-OpenRouterApiConversation -ApiKey $apiKey -Model $model -Messages @($history) -Stream $true
+        Write-Host ""
+
+        if ($assistantText) {
+            $history.Add([PSCustomObject]@{ role = "assistant"; content = $assistantText; model = $model })
+        }
+    }
+}
+
+function Invoke-OpenRouterCommand {
+    param(
+        [string]$SubCommand,
+        [string[]]$SubArgs,
+        $PipelineData = $null
+    )
+
+    $action = if ($SubCommand) { $SubCommand.ToLowerInvariant() } else { "" }
+
+    # Detect if piped data is present or flags indicate prompt
+    $isPromptAction = ($action -eq "prompt")
+    if (-not $isPromptAction -and ($action -notin @("key", "models", "chat", "help"))) {
+        if ($PipelineData -and $PipelineData.Count -gt 0) {
+            $isPromptAction = $true
+        } elseif ($SubCommand -in @("-p", "-f", "-m", "--prompt", "--prompt-file", "--model", "--free") -or
+                  ($SubArgs -and ($SubArgs -contains "-p" -or $SubArgs -contains "-f" -or $SubArgs -contains "--prompt" -or $SubArgs -contains "--prompt-file"))) {
+            $isPromptAction = $true
+        }
+    }
+
+    if ($isPromptAction) {
+        $promptArgs = [System.Collections.Generic.List[string]]::new()
+        if ($SubCommand -and $SubCommand -ne "prompt") { $promptArgs.Add($SubCommand) }
+        if ($SubArgs) { $promptArgs.AddRange($SubArgs) }
+        Invoke-OpenRouterPromptCommand -SubArgs @($promptArgs) -PipelineData $PipelineData
+        return
+    }
+
+    switch ($action) {
+        "key" {
+            $keyAction = if ($SubArgs -and $SubArgs.Count -gt 0) { $SubArgs[0].ToLowerInvariant() } else { "test" }
+            switch ($keyAction) {
+                "set" {
+                    $keyValue = if ($SubArgs.Count -gt 1) { $SubArgs[1] } else { $null }
+                    if (-not $keyValue) {
+                        $keyValue = Read-Host "Enter OpenRouter API Key"
+                    }
+                    if (-not $keyValue) {
+                        Write-Error "Error: No API key provided."
+                        Exit-Multigravity 1
+                    }
+                    Set-OpenRouterApiKey $keyValue | Out-Null
+                }
+                "test" {
+                    $testKey = if ($SubArgs.Count -gt 1) { $SubArgs[1] } else { $null }
+                    Test-OpenRouterApiKey $testKey | Out-Null
+                }
+                "remove" {
+                    Remove-OpenRouterApiKey
+                }
+                "delete" {
+                    Remove-OpenRouterApiKey
+                }
+                default {
+                    Write-Host "Usage: multigravity openrouter key [set <key> | test | remove]"
+                }
+            }
+        }
+        "models" {
+            $refresh = ($SubArgs -contains "--refresh" -or $SubArgs -contains "-f")
+            $freeOnly = ($SubArgs -contains "--free" -or $SubArgs -contains "-free")
+            $search = $null
+            for ($i = 0; $i -lt $SubArgs.Count; $i++) {
+                if (($SubArgs[$i] -in @("--search", "-s", "--query", "-q")) -and ($i + 1 -lt $SubArgs.Count)) {
+                    $search = $SubArgs[$i + 1]
+                    break
+                }
+            }
+            if (-not $search -and $SubArgs) {
+                $nonFlags = @($SubArgs | Where-Object { -not $_.StartsWith("-") })
+                if ($nonFlags.Count -gt 0) {
+                    $search = $nonFlags[0]
+                }
+            }
+
+            $models = Get-OpenRouterModels -Refresh:$refresh -FreeOnly:$freeOnly -Search $search
+            Write-Host "OpenRouter Models Catalog (Count: $($models.Count)):" -ForegroundColor Cyan
+            Format-OpenRouterModelsTable -Models $models
+        }
+        "chat" {
+            Invoke-OpenRouterChatCommand -SubArgs $SubArgs
+        }
+        "help" {
+            Write-Host "OpenRouter API Chat & Prompt Shim (multigravity openrouter)"
+            Write-Host ""
+            Write-Host "Commands:"
+            Write-Host "  multigravity openrouter models [--free] [--search <term>] [--refresh]"
+            Write-Host "  multigravity openrouter key [set <api-key> | test | remove]"
+            Write-Host "  multigravity openrouter prompt -m <model> [-p <prompt> | -f <file>] [--project <name>] [--save-conv] [-t <title>] [-w <dir>]"
+            Write-Host "  multigravity openrouter chat [-m <model>] [--project <name>] [-w <dir>]"
+            Write-Host ""
+            Write-Host "Examples:"
+            Write-Host "  multigravity openrouter -p `"Explain quantum computing in 2 sentences`""
+            Write-Host "  multigravity or prompt -m meta-llama/llama-3.3-70b-instruct:free -f ./prompt.md --save-conv"
+            Write-Host "  Get-Content ./task.md | multigravity or -m google/gemini-2.5-flash -y --save-conv -t `"Task Analysis`""
+            Write-Host "  multigravity or chat -m deepseek/deepseek-r1:free"
+        }
+        default {
+            if ($action.StartsWith("-") -or $action -eq "models" -or [string]::IsNullOrWhiteSpace($action)) {
+                $allArgs = @()
+                if ($SubCommand) { $allArgs += $SubCommand }
+                if ($SubArgs) { $allArgs += $SubArgs }
+                $refresh = ($allArgs -contains "--refresh" -or $allArgs -contains "-f")
+                $freeOnly = ($allArgs -contains "--free" -or $allArgs -contains "-free")
+                $search = $null
+                for ($i = 0; $i -lt $allArgs.Count; $i++) {
+                    if (($allArgs[$i] -in @("--search", "-s", "--query", "-q")) -and ($i + 1 -lt $allArgs.Count)) {
+                        $search = $allArgs[$i + 1]
+                        break
+                    }
+                }
+                $models = Get-OpenRouterModels -Refresh:$refresh -FreeOnly:$freeOnly -Search $search
+                Write-Host "OpenRouter Models Catalog (Count: $($models.Count)):" -ForegroundColor Cyan
+                Format-OpenRouterModelsTable -Models $models
+            } else {
+                Write-Error "Unknown openrouter command '$SubCommand'. Run 'multigravity openrouter help'."
+                Exit-Multigravity 1
+            }
+        }
+    }
+}
 } # end begin
 
 process {
@@ -4212,6 +6118,32 @@ try {
     if ($PSBoundParameters.ContainsKey('p')) {
         $rawTokens.Add("-p")
         $rawTokens.Add($p)
+    }
+    if ($PSBoundParameters.ContainsKey('w')) {
+        $rawTokens.Add("-w")
+        $rawTokens.Add($w)
+    }
+    if ($PSBoundParameters.ContainsKey('t')) {
+        $rawTokens.Add("-t")
+        $rawTokens.Add($t)
+    }
+    if ($PSBoundParameters.ContainsKey('m')) {
+        $rawTokens.Add("-m")
+        $rawTokens.Add($m)
+    }
+    if ($PSBoundParameters.ContainsKey('s')) {
+        $rawTokens.Add("-s")
+        $rawTokens.Add($s)
+    }
+    if ($PSBoundParameters.ContainsKey('f')) {
+        $rawTokens.Add("-f")
+        $rawTokens.Add($f)
+    }
+    if ($PSBoundParameters.ContainsKey('r')) {
+        $rawTokens.Add("-r")
+    }
+    if ($PSBoundParameters.ContainsKey('q')) {
+        $rawTokens.Add("-q")
     }
 
     if ($rawTokens.Count -eq 0) {
@@ -4351,6 +6283,27 @@ try {
         }
         "hook" {
             Invoke-HooksCommand $arg1 $extra
+            break
+        }
+        "openrouter" {
+            Invoke-OpenRouterCommand $arg1 $subForward $pipelineBuffer
+        }
+        "or" {
+            Invoke-OpenRouterCommand $arg1 $subForward $pipelineBuffer
+        }
+        "shim" {
+            Invoke-OpenRouterCommand $arg1 $subForward $pipelineBuffer
+        }
+        "conv" {
+            Invoke-ConversationCommand $arg1 $subForward
+            break
+        }
+        "conversation" {
+            Invoke-ConversationCommand $arg1 $subForward
+            break
+        }
+        "conversations" {
+            Invoke-ConversationCommand $arg1 $subForward
             break
         }
         "app" {
