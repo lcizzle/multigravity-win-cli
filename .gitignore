@@ -1,2 +1,3 @@
 test.sh
 .agents/tmp/
+.agents/temp/prompts/api/
